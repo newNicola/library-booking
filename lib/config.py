@@ -7,11 +7,14 @@ typed accessors for every user-adjustable parameter.
 
 import json
 import os
+import sys
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+# When packaged as exe, config lives next to the executable
+_CONFIG_DIR = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, 'frozen', False) else APP_DIR
+CONFIG_FILE = os.path.join(_CONFIG_DIR, "config.json")
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "date_range_days": 7,

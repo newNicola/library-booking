@@ -146,7 +146,7 @@ def _build_main_app(root) -> "BookingApp":
     app.seats: List[SeatInfo] = []
     app.booking_in_progress = False
     app._multi_dates: List[str] = []
-    app._multi_slot: Optional[dict] = None
+    app._multi_slots: List[dict] = []
 
     app._apply_theme(app.config.theme)
     app._build_ui()
@@ -510,7 +510,7 @@ class BookingApp:
         self.seats: List[SeatInfo] = []
         self.booking_in_progress = False
         self._multi_dates: List[str] = []
-        self._multi_slot: Optional[dict] = None
+        self._multi_slots: List[dict] = []
 
         self._apply_theme(self.config.theme)
         self._build_ui()
@@ -568,10 +568,40 @@ class BookingApp:
             page = context.new_page()
             page.goto(self._LOGIN_URL)
 
-            self.queue.put(("result", "请在 30 秒内完成登录..."))
-            self.root.after(0, lambda: self.status_bar.set_step("等待登录 (30秒)..."))
+            self.queue.put(("result", "请在浏览器中完成登录，最长等待 120 秒..."))
+            self.root.after(0, lambda: self.status_bar.set_step("等待登录..."))
 
-            time.sleep(30)
+            # Poll for ehall cookies — only set after real authentication
+            login_timeout = 120  # seconds
+            poll_interval = 2    # seconds
+            elapsed = 0
+            logged_in = False
+            while elapsed < login_timeout:
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+                try:
+                    cookies = context.cookies()
+                    ehall_cookies = [c for c in cookies if "ehall" in c.get("domain", "")]
+                    if ehall_cookies:
+                        logged_in = True
+                        self.queue.put(("result", "检测到登录成功"))
+                        break
+                except Exception:
+                    pass
+                # Update countdown every 10 seconds
+                if elapsed % 10 == 0:
+                    remain = login_timeout - elapsed
+                    self.root.after(0, lambda r=remain: self.status_bar.set_step(f"等待登录 ({r}s)..."))
+
+            if not logged_in:
+                self.queue.put(("result", "等待超时，请重新登录"))
+                context.close()
+                browser.close()
+                pw.stop()
+                return
+
+            # Wait a moment for redirects to settle
+            time.sleep(2)
 
             # Navigate to appointment page to get subsystem cookies
             self.queue.put(("result", "跳转到预约页面..."))
@@ -822,7 +852,7 @@ class BookingApp:
                 return
 
         self._multi_dates = []
-        self._multi_slot = None
+        self._multi_slots = []
         self._show_multi_day_picker(sub_floor)
 
     def _show_multi_day_picker(self, sub_floor: dict) -> None:
@@ -837,19 +867,18 @@ class BookingApp:
         ttk.Label(dlg, text="已选座位后，选择时段并勾选日期：",
                   font=("Microsoft YaHei", 10, "bold")).pack(anchor=W, padx=15, pady=(15, 2))
 
-        # --- time slot selector ---
-        slot_frame = ttk.Frame(dlg)
-        slot_frame.pack(fill=X, padx=15, pady=(0, 5))
-        ttk.Label(slot_frame, text="预约时段：", font=("Microsoft YaHei", 9)).pack(side=LEFT)
-        slot_var = tk.StringVar()
+        # --- time slot multi-selector ---
+        ttk.Label(dlg, text="预约时段（可多选）：", font=("Microsoft YaHei", 9)).pack(anchor=W, padx=15, pady=(0, 2))
+        slot_box = ttk.Frame(dlg)
+        slot_box.pack(fill=X, padx=15, pady=(0, 5))
         slot_labels = [s["label"] for s in self.config.time_slots]
-        slot_combo = ttk.Combobox(slot_frame, textvariable=slot_var, values=slot_labels,
-                                  state="readonly", width=18)
-        slot_combo.pack(side=LEFT, padx=2)
-        if slot_labels:
-            slot_var.set(slot_labels[0])
+        slot_check_vars: List[tk.BooleanVar] = []
+        for i, label in enumerate(slot_labels):
+            var = tk.BooleanVar(value=(i == 0))  # default: first slot checked
+            slot_check_vars.append(var)
+            ttk.Checkbutton(slot_box, text=label, variable=var).pack(side=LEFT, padx=(0, 10))
 
-        ttk.Label(dlg, text="⚠ 将对每个勾选日期预约上方所选时段",
+        ttk.Label(dlg, text="⚠ 将对每个 日期 × 时段 的组合分别预约",
                   foreground="orange").pack(anchor=W, padx=15, pady=(0, 5))
 
         # --- bottom bar (pack first so it always reserves its space) ---
@@ -913,19 +942,19 @@ class BookingApp:
             if not self.seats_area.selected_seat:
                 MB.show_warning("提示", "请先在座位区点击选择座位")
                 return
-            chosen_label = slot_var.get()
-            chosen_slot = None
-            for s in self.config.time_slots:
-                if s["label"] == chosen_label:
-                    chosen_slot = s
-                    break
-            if not chosen_slot:
-                MB.show_warning("提示", "请选择预约时段")
+            # Collect selected time slots
+            chosen_slots = []
+            for i, var in enumerate(slot_check_vars):
+                if var.get():
+                    chosen_slots.append(self.config.time_slots[i])
+            if not chosen_slots:
+                MB.show_warning("提示", "请至少选择一个时段")
                 return
             self._multi_dates = selected
-            self._multi_slot = chosen_slot
+            self._multi_slots = chosen_slots
             dlg.destroy()
-            self.log(f"多天预约：{len(selected)} 天 × {chosen_slot['label']} — {', '.join(selected)}")
+            slot_names = ", ".join(s["label"] for s in chosen_slots)
+            self.log(f"多天预约：{len(selected)} 天 × {len(chosen_slots)} 时段 — {', '.join(selected)}")
             self._sync_book_button_state()
             self._run_multi_day_booking(sub_floor)
 
@@ -1048,17 +1077,17 @@ class BookingApp:
                 if not ok:
                     self.seats = []
                     self.seats_area.set_seats([], self.config.show_only_available)
-                    reason = data if isinstance(data, str) else "unknown"
-                    self.log(f"Failed to load seats: {reason}")
-                    self.status_bar.set_step("Load failed")
+                    reason = data if isinstance(data, str) else "未知错误"
+                    self.log(f"加载座位失败: {reason}")
+                    self.status_bar.set_step("加载失败")
                     self._sync_book_button_state()
                     return
                 if isinstance(data, list):
                     self.seats = data
                     avail = sum(1 for s in data if s.is_available)
                     self.seats_area.set_seats(data, self.config.show_only_available)
-                    self.log(f"Loaded {len(data)} seats (available: {avail})")
-                    self.status_bar.set_step("Select a seat" if data else "No seats")
+                    self.log(f"获取到 {len(data)} 个座位 (可用: {avail})")
+                    self.status_bar.set_step("请选择座位" if data else "无座位")
                     self._sync_book_button_state()
                     return
 
@@ -1069,9 +1098,9 @@ class BookingApp:
                 elif ok and isinstance(data, ViolationInfo):
                     self.status_bar.set_violations(data.remainCount,
                                                    data.remainCount + data.violatedCount)
-                    self.log(f"Violations: {data.remainCount} remaining")
+                    self.log(f"违约: 剩余 {data.remainCount} 次")
                 else:
-                    self.log("Failed to load violation info.")
+                    self.log("加载违约信息失败")
                 return
 
             if tag == "floors" and (ok == "expired" or not ok or not data):
@@ -1080,8 +1109,8 @@ class BookingApp:
                     self._open_browser_login()
                 else:
                     self.floors = []
-                    reason = data if isinstance(data, str) else ("No data" if not ok else "Empty response")
-                    self.log(f"Failed to load floors: {reason}")
+                    reason = data if isinstance(data, str) else ("无数据" if not ok else "响应为空")
+                    self.log(f"加载场所失败: {reason}")
                 self._sync_book_button_state()
                 return
 
@@ -1092,9 +1121,9 @@ class BookingApp:
                 else:
                     self.sub_floors = []
                     self.sub_floor_combo["values"] = []
-                    reason = data if isinstance(data, str) else ("No data" if not ok else "Empty response")
-                    self.log(f"Failed to load partitions: {reason}")
-                    self.status_bar.set_step("Load failed" if not ok else "No partitions")
+                    reason = data if isinstance(data, str) else ("无数据" if not ok else "响应为空")
+                    self.log(f"加载分区失败: {reason}")
+                    self.status_bar.set_step("加载失败" if not ok else "无分区")
                 self._sync_book_button_state()
                 return
 
@@ -1148,7 +1177,7 @@ class BookingApp:
             # String
             if isinstance(data, str):
                 if ok is False:
-                    self.log(f"Operation failed: {data}")
+                    self.log(f"操作失败: {data}")
                 else:
                     self.log(data)
                 return
@@ -1187,7 +1216,7 @@ class BookingApp:
             MB.show_error("提示", "请先点击选择一个座位")
             return
         if not seat.is_available:
-            MB.show_error("Notice", "Please choose an available seat.")
+            MB.show_error("提示", "请选择可用的座位")
             return
         if not sub_floor:
             MB.show_error("提示", "请先选择分区")
@@ -1206,14 +1235,15 @@ class BookingApp:
     def _run_multi_day_booking(self, sub_floor: dict) -> None:
         seat = self.seats_area.selected_seat
         if seat is None:
-            self.log("ERR: 未选中座位")
+            self.log("错误: 未选中座位")
             self._booking_finished()
             return
-        slot = self._multi_slot
+        slots = self._multi_slots
         dates = list(self._multi_dates)
         self._multi_pending: List[tuple] = []
         for d in dates:
-            self._multi_pending.append((d, slot["begin"], slot["end"]))
+            for slot in slots:
+                self._multi_pending.append((d, slot["begin"], slot["end"]))
         self._multi_success = 0
         self._multi_fail = 0
         self._multi_total = len(self._multi_pending)
@@ -1224,7 +1254,8 @@ class BookingApp:
         self.status_bar.set_step(f"多天预约 0/{self._multi_total}...")
         self.log("=" * 40)
         self.log(f"多天预约: {sub_floor.get('FLOOR_NUM')} {seat.SEAT_NUM}")
-        self.log(f"时段: {slot['label']} | 日期: {', '.join(dates)} | 共 {self._multi_total} 次预约")
+        slot_names = ", ".join(s["label"] for s in slots)
+        self.log(f"时段: {slot_names} | 日期: {', '.join(dates)} | 共 {self._multi_total} 次预约")
         self._process_next_multi(seat, sub_floor)
 
     def _process_next_multi(self, seat: SeatInfo, sub_floor: dict) -> None:
@@ -1244,13 +1275,13 @@ class BookingApp:
                                              sub_floor.get("FLOOR_NUM", ""), date_str, begin, end)
                 if ok:
                     self._multi_success += 1
-                    self.queue.put(("result", f"OK  {date_str} {begin}-{end} {msg}"))
+                    self.queue.put(("result", f"成功 {date_str} {begin}-{end} {msg}"))
                 else:
                     self._multi_fail += 1
-                    self.queue.put(("result", f"FAIL {date_str} {begin}-{end} {msg or 'unknown'}"))
+                    self.queue.put(("result", f"失败 {date_str} {begin}-{end} {msg or '未知错误'}"))
             except Exception as exc:
                 self._multi_fail += 1
-                self.queue.put(("result", f"ERR {date_str} {begin}-{end} {exc}"))
+                self.queue.put(("result", f"异常 {date_str} {begin}-{end} {exc}"))
             finally:
                 self.root.after(0, lambda: self._process_next_multi(seat, sub_floor))
         threading.Thread(target=_flow, daemon=True).start()
@@ -1266,16 +1297,15 @@ class BookingApp:
         def _flow() -> None:
             try:
                 api = self.api
-                self.queue.put(("result", "Submitting booking..."))
+                self.queue.put(("result", "正在提交预约..."))
                 ok, msg = api.submit_booking(seat, sub_floor["PLACE_WID"], sub_floor["WID"],
                                              sub_floor.get("FLOOR_NUM", ""), date_str, begin, end)
-                self.queue.put(("result", f"submit_booking returned ok={ok}, msg={msg!r}"))
                 if ok:
-                    self.queue.put(("result", f"Booking succeeded: {seat.SEAT_NUM} {date_str} {begin}-{end}"))
+                    self.queue.put(("result", f"预约成功: {seat.SEAT_NUM} {date_str} {begin}-{end}"))
                 else:
-                    self.queue.put(("result", f"Booking failed: {msg or 'unknown error'}"))
+                    self.queue.put(("result", f"预约失败: {msg or '未知错误'}"))
             except Exception as exc:
-                self.queue.put(("result", f"Booking exception: {exc}"))
+                self.queue.put(("result", f"预约异常: {exc}"))
             finally:
                 self.root.after(0, self._booking_finished)
 
@@ -1284,7 +1314,7 @@ class BookingApp:
     def _booking_finished(self) -> None:
         self.booking_in_progress = False
         self._unlock_controls()
-        self.status_bar.set_step("Booking finished")
+        self.status_bar.set_step("预约完成")
 
     @property
     def selected_seat(self) -> Optional[SeatInfo]:

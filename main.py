@@ -9,6 +9,16 @@ then launches the GUI.
 import os
 import sys
 
+# Hide console window on Windows immediately after startup
+if sys.platform == "win32":
+    import ctypes
+    try:
+        _hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if _hwnd:
+            ctypes.windll.user32.ShowWindow(_hwnd, 0)  # SW_HIDE
+    except Exception:
+        pass
+
 # Ensure the lib directory is on the path
 _LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
 if _LIB_DIR not in sys.path:

@@ -8,6 +8,7 @@ Cookie handling is automatic from cookies.json.
 
 import json
 import os
+import sys
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -16,8 +17,10 @@ import requests
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_URL = "https://ehall.hebau.edu.cn/qljfwapp/sys/lwAppointmentPublicPlace"
-COOKIES_FILE = os.path.join(APP_DIR, "..", "cookies.json")
-PROFILE_FILE = os.path.join(APP_DIR, "..", "user_profile.json")
+# When packaged as exe, user files live next to the executable
+_USER_DIR = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, 'frozen', False) else os.path.join(APP_DIR, "..")
+COOKIES_FILE = os.path.join(_USER_DIR, "cookies.json")
+PROFILE_FILE = os.path.join(_USER_DIR, "user_profile.json")
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
