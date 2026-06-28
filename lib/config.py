@@ -39,7 +39,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 def _load() -> Dict[str, Any]:
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
                 saved: Dict[str, Any] = json.load(f)
             merged = DEFAULT_CONFIG.copy()
             merged.update(saved)

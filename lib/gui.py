@@ -13,6 +13,7 @@ from datetime import datetime
 from tkinter import ttk
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import requests
 import ttkbootstrap as ttkb
 from ttkbootstrap.constants import *
 from ttkbootstrap.dialogs import Messagebox
@@ -27,7 +28,132 @@ import sys
 sys.path.insert(0, _LIB_DIR)
 
 from config import Config
-from api_client import APIClient, FloorInfo, SeatInfo, ViolationInfo, COOKIES_FILE, PROFILE_FILE
+from api_client import APIClient, FloorInfo, SeatInfo, ViolationInfo, COOKIES_FILE, PROFILE_FILE, _resp_json
+
+
+# ---------------------------------------------------------------------------
+# Key Verification
+# ---------------------------------------------------------------------------
+
+_KEY_SERVER = "http://81.70.40.146:5000/check_key"
+
+
+def verify_key(key: str) -> Tuple[bool, str]:
+    """Send *key* to the remote server and return (success, message)."""
+    try:
+        resp = requests.post(_KEY_SERVER, json={"key": key}, timeout=10)
+        data = _resp_json(resp)
+        if data.get("status") == "ok":
+            return True, data.get("msg", "验证成功")
+        return False, data.get("msg", "密钥无效")
+    except requests.exceptions.Timeout:
+        return False, "请求超时，请检查网络连接"
+    except requests.exceptions.ConnectionError:
+        return False, "无法连接验证服务器"
+    except Exception as exc:
+        return False, f"验证失败: {exc}"
+
+
+def _show_key_dialog():
+    """Show key verification window. Returns the ttkb.Window on success, None on cancel."""
+    root = ttkb.Window(themename="superhero", title="密钥验证")
+    root.resizable(False, False)
+
+    # Center on screen
+    w, h = 380, 180
+    root.update_idletasks()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    x = (sw - w) // 2
+    y = (sh - h) // 2
+    root.geometry(f"{w}x{h}+{x}+{y}")
+
+    ttkb.Style().configure("Key.TLabel", font=("Microsoft YaHei", 10))
+    ttkb.Style().configure("Key.TButton", font=("Microsoft YaHei", 10))
+
+    frm = ttk.Frame(root, padding=20)
+    frm.pack(fill=BOTH, expand=True)
+
+    ttkb.Label(frm, text="请输入授权密钥以继续使用：", style="Key.TLabel").pack(pady=(0, 12))
+
+    key_var = tk.StringVar()
+    entry = ttkb.Entry(frm, textvariable=key_var, width=30, show="*")
+    entry.pack(pady=5)
+    entry.focus_set()
+
+    result = {"ok": False}
+
+    def _submit():
+        k = key_var.get().strip()
+        if not k:
+            return
+        ok, msg = verify_key(k)
+        if ok:
+            result["ok"] = True
+            root.quit()  # exit mainloop without destroying window
+        else:
+            MB.show_error("验证失败", msg, parent=root)
+            entry.delete(0, tk.END)
+            entry.focus_set()
+
+    def _on_enter(_e=None):
+        _submit()
+
+    entry.bind("<Return>", _on_enter)
+
+    btn_frame = ttk.Frame(frm)
+    btn_frame.pack(pady=(15, 0))
+
+    ttkb.Button(btn_frame, text="确定", command=_submit, style="Key.TButton").pack(side=tk.LEFT, padx=10)
+    ttkb.Button(btn_frame, text="取消", command=root.destroy, style="Key.TButton").pack(side=tk.LEFT, padx=10)
+
+    root.mainloop()
+
+    if not result["ok"]:
+        root.destroy()
+        return None
+
+    # Clear all key-dialog widgets so the root is ready for the main UI
+    for child in root.winfo_children():
+        child.destroy()
+    root.resizable(True, True)
+    return root
+
+
+def _build_main_app(root) -> "BookingApp":
+    """Build the main BookingApp reusing the existing root window."""
+    app = object.__new__(BookingApp)
+    app.root = root
+    app.root.title("河北农业大学图书馆座位预约")
+
+    # Center and resize the window
+    w, h = 1000, 700
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    x = (sw - w) // 2
+    y = (sh - h) // 2
+    app.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    app.config = Config()
+    app.api = APIClient()
+    app.queue: queue.Queue = queue.Queue()
+    app.threaded_api = ThreadedAPIClient(app.api, app.queue)
+
+    app.mode = tk.StringVar(value="manual")
+    app.floors: List[FloorInfo] = []
+    app.sub_floors: List[dict] = []
+    app.selected_sub_floor: Optional[dict] = None
+    app.seats: List[SeatInfo] = []
+    app.booking_in_progress = False
+    app._multi_dates: List[str] = []
+    app._multi_slot: Optional[dict] = None
+
+    app._apply_theme(app.config.theme)
+    app._build_ui()
+    app._check_cookie()
+    app.root.after(200, app._process_queue)
+    app.root.bind_all("<<SeatSelected>>", lambda _e: app._sync_book_button_state())
+    return app
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +250,11 @@ class StatusBar(ttk.Frame):
         self.violation_label = ttk.Label(self, text="违约: --", foreground="gray")
         self.step_label = ttk.Label(self, text="就绪", foreground="blue")
         self.status_label = ttk.Label(self, text="", foreground="black")
+        self.by_label = ttk.Label(self, text="by nicola", foreground="gray", font=("Microsoft YaHei", 8))
         self.violation_label.pack(side=LEFT, padx=(5, 0))
         self.step_label.pack(side=LEFT, padx=(20, 0))
         self.status_label.pack(side=RIGHT, padx=(0, 5))
+        self.by_label.pack(side=RIGHT, padx=(0, 5))
 
     def set_violations(self, remain: int, total: int) -> None:
         self.violation_label.config(text=f"违约剩余: {remain}/{total}")
@@ -365,8 +493,8 @@ class SeatGrid(ttk.Frame):
 class BookingApp:
     """Main application window."""
 
-    def __init__(self) -> None:
-        self.root = ttkb.Window(themename="superhero")
+    def __init__(self, root: Optional[tk.Tk] = None) -> None:
+        self.root = root or ttkb.Window(themename="superhero")
         self.root.title("河北农业大学图书馆座位预约")
         self.root.geometry("1000x700")
 
@@ -382,6 +510,7 @@ class BookingApp:
         self.seats: List[SeatInfo] = []
         self.booking_in_progress = False
         self._multi_dates: List[str] = []
+        self._multi_slot: Optional[dict] = None
 
         self._apply_theme(self.config.theme)
         self._build_ui()
@@ -693,20 +822,34 @@ class BookingApp:
                 return
 
         self._multi_dates = []
+        self._multi_slot = None
         self._show_multi_day_picker(sub_floor)
 
     def _show_multi_day_picker(self, sub_floor: dict) -> None:
         dlg = ttkb.Toplevel(title="选择日期范围")
         dlg.transient(self.root)
         dlg.grab_set()
-        dlg.minsize(420, 440)
+        dlg.minsize(420, 480)
 
         dates = self.config.get_available_dates()
 
         # --- top label ---
-        ttk.Label(dlg, text="已选座位后，勾选日期并确认:",
+        ttk.Label(dlg, text="已选座位后，选择时段并勾选日期：",
                   font=("Microsoft YaHei", 10, "bold")).pack(anchor=W, padx=15, pady=(15, 2))
-        ttk.Label(dlg, text="⚠ 将对每个勾选日期预约全部 7 个时段",
+
+        # --- time slot selector ---
+        slot_frame = ttk.Frame(dlg)
+        slot_frame.pack(fill=X, padx=15, pady=(0, 5))
+        ttk.Label(slot_frame, text="预约时段：", font=("Microsoft YaHei", 9)).pack(side=LEFT)
+        slot_var = tk.StringVar()
+        slot_labels = [s["label"] for s in self.config.time_slots]
+        slot_combo = ttk.Combobox(slot_frame, textvariable=slot_var, values=slot_labels,
+                                  state="readonly", width=18)
+        slot_combo.pack(side=LEFT, padx=2)
+        if slot_labels:
+            slot_var.set(slot_labels[0])
+
+        ttk.Label(dlg, text="⚠ 将对每个勾选日期预约上方所选时段",
                   foreground="orange").pack(anchor=W, padx=15, pady=(0, 5))
 
         # --- bottom bar (pack first so it always reserves its space) ---
@@ -770,9 +913,19 @@ class BookingApp:
             if not self.seats_area.selected_seat:
                 MB.show_warning("提示", "请先在座位区点击选择座位")
                 return
+            chosen_label = slot_var.get()
+            chosen_slot = None
+            for s in self.config.time_slots:
+                if s["label"] == chosen_label:
+                    chosen_slot = s
+                    break
+            if not chosen_slot:
+                MB.show_warning("提示", "请选择预约时段")
+                return
             self._multi_dates = selected
+            self._multi_slot = chosen_slot
             dlg.destroy()
-            self.log(f"多天预约: {len(selected)} 天 — {', '.join(selected)}")
+            self.log(f"多天预约：{len(selected)} 天 × {chosen_slot['label']} — {', '.join(selected)}")
             self._sync_book_button_state()
             self._run_multi_day_booking(sub_floor)
 
@@ -1056,12 +1209,11 @@ class BookingApp:
             self.log("ERR: 未选中座位")
             self._booking_finished()
             return
-        slots = self.config.time_slots
+        slot = self._multi_slot
         dates = list(self._multi_dates)
         self._multi_pending: List[tuple] = []
         for d in dates:
-            for s in slots:
-                self._multi_pending.append((d, s["begin"], s["end"]))
+            self._multi_pending.append((d, slot["begin"], slot["end"]))
         self._multi_success = 0
         self._multi_fail = 0
         self._multi_total = len(self._multi_pending)
@@ -1072,7 +1224,7 @@ class BookingApp:
         self.status_bar.set_step(f"多天预约 0/{self._multi_total}...")
         self.log("=" * 40)
         self.log(f"多天预约: {sub_floor.get('FLOOR_NUM')} {seat.SEAT_NUM}")
-        self.log(f"日期: {', '.join(dates)} | 共 {self._multi_total} 个时段")
+        self.log(f"时段: {slot['label']} | 日期: {', '.join(dates)} | 共 {self._multi_total} 次预约")
         self._process_next_multi(seat, sub_floor)
 
     def _process_next_multi(self, seat: SeatInfo, sub_floor: dict) -> None:
