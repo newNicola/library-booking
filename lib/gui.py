@@ -28,7 +28,7 @@ import sys
 sys.path.insert(0, _LIB_DIR)
 
 from config import Config
-from api_client import APIClient, FloorInfo, SeatInfo, ViolationInfo, COOKIES_FILE, PROFILE_FILE, _resp_json
+from api_client import APIClient, FloorInfo, SeatInfo, ViolationInfo, AppointmentRecord, COOKIES_FILE, PROFILE_FILE, _resp_json
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +206,16 @@ class ThreadedAPIClient:
 
     def async_get_sub_floors(self, place_wid: str, date_str: str) -> None:
         self._dispatch(self._client.get_sub_floors, place_wid, date_str, result_tag="sub_floors")
+
+    def async_get_appointment_records(self, date_str: str, page: int = 1,
+                                       page_size: int = 10,
+                                       cancelled_filter: str = "") -> None:
+        self._dispatch(self._client.get_appointment_records, date_str, page, page_size,
+                       cancelled_filter, result_tag="records")
+
+    def async_cancel_appointment(self, wid: str, ending_date: str) -> None:
+        self._dispatch(self._client.cancel_appointment, wid, ending_date,
+                       result_tag="cancel")
 
 
 # ---------------------------------------------------------------------------
@@ -558,15 +568,42 @@ class BookingApp:
     def _playwright_login_flow(self) -> None:
         """Use Playwright + system Edge to let user login, then save cookies."""
         import json
+        import subprocess
         import time
-        from playwright.sync_api import sync_playwright
 
         try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.queue.put(("result", "Playwright 未安装，请在命令行执行: pip install playwright && playwright install"))
+            return
+
+        try:
+            self.queue.put(("result", "正在启动 Playwright 驱动..."))
             pw = sync_playwright().start()
-            browser = pw.chromium.launch(channel="msedge", headless=False)
+
+            self.queue.put(("result", "正在启动 Edge 浏览器..."))
+            try:
+                browser = pw.chromium.launch(channel="msedge", headless=False, timeout=15000)
+            except Exception as launch_err:
+                self.queue.put(("result", f"Edge 启动失败 ({launch_err})，尝试使用 Chromium..."))
+                try:
+                    browser = pw.chromium.launch(headless=False, timeout=15000)
+                except Exception:
+                    self.queue.put(("result", f"浏览器启动失败，请手动打开 Edge 访问登录页面"))
+                    pw.stop()
+                    return
+
             context = browser.new_context()
             page = context.new_page()
-            page.goto(self._LOGIN_URL)
+            self.queue.put(("result", "正在打开登录页面..."))
+            try:
+                page.goto(self._LOGIN_URL, timeout=20000)
+            except Exception as nav_err:
+                self.queue.put(("result", f"打开登录页面超时 ({nav_err})，请检查网络"))
+                context.close()
+                browser.close()
+                pw.stop()
+                return
 
             self.queue.put(("result", "请在浏览器中完成登录，最长等待 120 秒..."))
             self.root.after(0, lambda: self.status_bar.set_step("等待登录..."))
@@ -775,6 +812,7 @@ class BookingApp:
                                         command=self._start_multi_day, state=tk.DISABLED)
         self.btn_multi_day.pack_forget()
         ttk.Button(btn_frame, text="设置", command=self._show_settings).pack(side=LEFT, padx=5)
+        ttk.Button(btn_frame, text="预约记录", command=self._show_records).pack(side=LEFT, padx=5)
 
         self.log_panel = LogPanel(bottom)
         self.log_panel.pack(fill=BOTH, expand=True)
@@ -1060,7 +1098,7 @@ class BookingApp:
         self.root.after(200, self._process_queue)
 
     def _handle_result(self, result: Any) -> None:
-        result_tags = {"floors", "sub_floors", "seats", "violations"}
+        result_tags = {"floors", "sub_floors", "seats", "violations", "records", "cancel"}
         tag = ""
         if isinstance(result, tuple) and len(result) == 2 and result[0] in result_tags:
             tag, result = result
@@ -1101,6 +1139,32 @@ class BookingApp:
                     self.log(f"违约: 剩余 {data.remainCount} 次")
                 else:
                     self.log("加载违约信息失败")
+                return
+
+            if tag == "records":
+                if ok == "expired":
+                    self.log("Cookie 已过期，请重新登录")
+                    self._open_browser_login()
+                elif ok and isinstance(data, dict):
+                    total = data.get("total", 0)
+                    self.log(f"查询到 {total} 条预约记录")
+                    if hasattr(self, '_records_update'):
+                        self._records_update(data)
+                else:
+                    reason = data.get("error", "未知错误") if isinstance(data, dict) else str(data)
+                    self.log(f"查询预约记录失败: {reason}")
+                return
+
+            if tag == "cancel":
+                if ok == "expired":
+                    self.log("Cookie 已过期，请重新登录")
+                    self._open_browser_login()
+                elif ok:
+                    self.log(f"取消成功: {data}")
+                    if hasattr(self, '_records_refresh'):
+                        self.root.after(500, self._records_refresh)
+                else:
+                    self.log(f"取消失败: {data}")
                 return
 
             if tag == "floors" and (ok == "expired" or not ok or not data):
@@ -1319,6 +1383,157 @@ class BookingApp:
     @property
     def selected_seat(self) -> Optional[SeatInfo]:
         return self.seats_area.selected_seat
+
+    # -- appointment records --
+
+    def _show_records(self) -> None:
+        dlg = ttkb.Toplevel(title="预约记录")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.minsize(700, 460)
+        w, h = 780, 500
+        sw = dlg.winfo_screenwidth()
+        sh = dlg.winfo_screenheight()
+        dlg.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+
+        page_var = tk.IntVar(value=1)
+        total_var = tk.IntVar(value=0)
+        page_size = 10
+        # Store record data keyed by tree item iid
+        record_data: Dict[str, dict] = {}
+
+        # --- top bar: date + filter + search ---
+        top_bar = ttk.Frame(dlg, padding=(10, 8, 10, 4))
+        top_bar.pack(fill=X)
+        ttk.Label(top_bar, text="日期：").pack(side=LEFT)
+        date_var = tk.StringVar()
+        dates = self.config.get_available_dates()
+        date_combo = ttk.Combobox(top_bar, textvariable=date_var, values=dates,
+                                  state="readonly", width=14)
+        date_combo.pack(side=LEFT, padx=2)
+        if dates:
+            date_var.set(dates[0])
+
+        ttk.Label(top_bar, text="状态：").pack(side=LEFT, padx=(10, 0))
+        filter_var = tk.StringVar(value="全部")
+        filter_combo = ttk.Combobox(top_bar, textvariable=filter_var,
+                                    values=["全部", "未取消", "已取消"],
+                                    state="readonly", width=8)
+        filter_combo.pack(side=LEFT, padx=2)
+
+        def _get_filter_value() -> str:
+            f = filter_var.get()
+            if f == "未取消":
+                return "0"
+            elif f == "已取消":
+                return "1"
+            return ""
+
+        def _load_records() -> None:
+            d = date_var.get()
+            if not d:
+                return
+            page_var.set(1)
+            self.threaded_api.async_get_appointment_records(d, 1, page_size, _get_filter_value())
+            self.log(f"正在查询 {d} 的预约记录...")
+
+        ttk.Button(top_bar, text="查询", command=_load_records).pack(side=LEFT, padx=8)
+
+        # --- treeview ---
+        cols = ("floor", "seat", "begin", "end", "cancelled", "violated", "created")
+        tree_frame = ttk.Frame(dlg, padding=(10, 0, 10, 0))
+        tree_frame.pack(fill=BOTH, expand=True)
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=14)
+        headers = {
+            "floor": "分区", "seat": "座位", "begin": "开始时间",
+            "end": "结束时间", "cancelled": "已取消", "violated": "违约", "created": "创建时间"
+        }
+        widths = {"floor": 130, "seat": 80, "begin": 130, "end": 130,
+                  "cancelled": 55, "violated": 55, "created": 130}
+        for col in cols:
+            tree.heading(col, text=headers[col])
+            tree.column(col, width=widths[col], minwidth=50)
+        vsb = ttk.Scrollbar(tree_frame, orient=VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side=LEFT, fill=BOTH, expand=True)
+        vsb.pack(side=RIGHT, fill=Y)
+
+        # --- bottom bar: pagination + cancel button ---
+        bot_bar = ttk.Frame(dlg, padding=(10, 4, 10, 8))
+        bot_bar.pack(fill=X)
+        page_label = ttk.Label(bot_bar, text="第 1 页 / 共 0 条")
+        page_label.pack(side=LEFT)
+
+        def _update_tree(result_data_in: dict) -> None:
+            nonlocal record_data
+            for item in tree.get_children():
+                tree.delete(item)
+            record_data.clear()
+            total = result_data_in.get("total", 0)
+            rows = result_data_in.get("rows", [])
+            total_var.set(total)
+            page = page_var.get()
+            page_label.config(text=f"第 {page} 页 / 共 {total} 条")
+            for r in rows:
+                begin_short = r.BEGINNING_DATE[5:16] if len(r.BEGINNING_DATE) > 10 else r.BEGINNING_DATE
+                end_short = r.ENDING_DATE[5:16] if len(r.ENDING_DATE) > 10 else r.ENDING_DATE
+                created_short = r.CREATED_AT[5:16] if len(r.CREATED_AT) > 10 else r.CREATED_AT
+                iid = tree.insert("", tk.END, values=(
+                    r.FLOOR_DISPLAY, r.SEAT_DISPLAY,
+                    begin_short, end_short,
+                    r.IS_CANCELLED, r.IS_VIOLATED, created_short
+                ))
+                record_data[iid] = {"wid": r.WID, "ending_date": r.ENDING_DATE,
+                                    "is_cancelled": r.IS_CANCELLED}
+
+        def _prev_page() -> None:
+            p = page_var.get()
+            if p > 1:
+                page_var.set(p - 1)
+                self.threaded_api.async_get_appointment_records(
+                    date_var.get(), p - 1, page_size, _get_filter_value())
+
+        def _next_page() -> None:
+            p = page_var.get()
+            total_pages = max(1, (total_var.get() + page_size - 1) // page_size)
+            if p < total_pages:
+                page_var.set(p + 1)
+                self.threaded_api.async_get_appointment_records(
+                    date_var.get(), p + 1, page_size, _get_filter_value())
+
+        def _cancel_selected() -> None:
+            sel = tree.selection()
+            if not sel:
+                MB.show_warning("提示", "请先点击选择一条预约记录")
+                return
+            iid = sel[0]
+            info = record_data.get(iid, {})
+            if info.get("is_cancelled") == "是":
+                MB.show_info("提示", "该预约已经取消")
+                return
+            wid = info.get("wid", "")
+            ending_date = info.get("ending_date", "")
+            if not wid:
+                MB.show_error("错误", "未找到预约信息")
+                return
+            if not MB.show_question("确认取消", f"确定要取消这条预约吗？\n座位: {tree.item(iid, 'values')[1]}\n时间: {tree.item(iid, 'values')[2]} - {tree.item(iid, 'values')[3]}"):
+                return
+            self.threaded_api.async_cancel_appointment(wid, ending_date)
+            self._records_refresh = _load_records
+            self.log(f"正在取消预约 {wid}...")
+
+        ttk.Button(bot_bar, text="取消预约", style="Danger.TButton",
+                   command=_cancel_selected).pack(side=LEFT, padx=(20, 4))
+        ttk.Button(bot_bar, text="下一页", command=_next_page).pack(side=RIGHT, padx=4)
+        ttk.Button(bot_bar, text="上一页", command=_prev_page).pack(side=RIGHT, padx=4)
+
+        # Store references for queue handler
+        self._records_tree = tree
+        self._records_update = _update_tree
+        self._records_refresh = _load_records
+
+        # Load initial data
+        _load_records()
 
     # -- settings --
 

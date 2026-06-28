@@ -96,6 +96,30 @@ class ViolationInfo:
         self.defaultPeriod = data.get("defaultPeriod", "")
 
 
+class AppointmentRecord:
+    WID: str
+    FLOOR_DISPLAY: str
+    SEAT_DISPLAY: str
+    BEGINNING_DATE: str
+    ENDING_DATE: str
+    IS_CANCELLED: str
+    IS_VIOLATED: str
+    CREATED_AT: str
+
+    def __init__(self, row: dict):
+        self.WID = row.get("WID", "")
+        self.FLOOR_DISPLAY = row.get("FLOOR_ID_DISPLAY", "")
+        self.SEAT_DISPLAY = row.get("SEAT_WID_DISPLAY", "")
+        self.BEGINNING_DATE = row.get("BEGINNING_DATE", "")
+        self.ENDING_DATE = row.get("ENDING_DATE", "")
+        self.IS_CANCELLED = row.get("IS_CANCELLED_DISPLAY", "否")
+        self.IS_VIOLATED = row.get("IS_VIOLATED_DISPLAY", "否")
+        self.CREATED_AT = row.get("CREATED_AT", "")
+
+    def __repr__(self):
+        return f"Record({self.FLOOR_DISPLAY} {self.SEAT_DISPLAY} {self.BEGINNING_DATE})"
+
+
 class APIClient:
     """Synchronous API client."""
 
@@ -515,6 +539,72 @@ class APIClient:
             return True, ViolationInfo(data)
         except Exception:
             return False, None
+
+    def get_appointment_records(self, date_str: str, page: int = 1,
+                                page_size: int = 10,
+                                cancelled_filter: str = "") -> Tuple[bool, dict]:
+        """Get appointment records for a given date.
+        cancelled_filter: "" = all, "0" = not cancelled, "1" = cancelled
+        Returns (ok, {"total": int, "rows": [AppointmentRecord, ...]})
+        """
+        url = f"{BASE_URL}/modules/myAppointment/getMyAppointmentRecord.do"
+        filters = [{
+            "name": "APPLY_DATE",
+            "caption": "预约日期",
+            "linkOpt": "AND",
+            "builderList": "cbl_String",
+            "builder": "equal",
+            "value": date_str,
+        }]
+        if cancelled_filter in ("0", "1"):
+            filters.append({
+                "name": "IS_CANCELLED",
+                "caption": "是否取消",
+                "linkOpt": "AND",
+                "builderList": "cbl_String",
+                "builder": "equal",
+                "value": cancelled_filter,
+            })
+        payload = {
+            "querySetting": json.dumps(filters),
+            "pageSize": str(page_size),
+            "pageNumber": str(page),
+        }
+        try:
+            resp = self.session.post(url, data=payload, timeout=15)
+            data = _resp_json(resp)
+            code = data.get("code")
+            if code == "1001":
+                return "expired", {}
+            if code != "0" and code != 0:
+                return False, {}
+            record_data = data.get("datas", {}).get("getMyAppointmentRecord", {})
+            total = record_data.get("totalSize", 0)
+            rows = [AppointmentRecord(r) for r in record_data.get("rows", [])]
+            return True, {"total": total, "rows": rows}
+        except Exception as exc:
+            return False, {"error": str(exc)}
+
+    def cancel_appointment(self, wid: str, ending_date: str) -> Tuple[bool, str]:
+        """Cancel an appointment. Returns (ok, message)."""
+        url = f"{BASE_URL}/api/appointmentCancel.do"
+        payload = {
+            "formData": json.dumps({
+                "WID": wid,
+                "ENDING_DATE": ending_date,
+            }),
+        }
+        try:
+            resp = self.session.post(url, data=payload, timeout=15)
+            data = _resp_json(resp)
+            code = data.get("code")
+            if code == "1001":
+                return "expired", "Cookie 已过期"
+            msg = data.get("msg", "")
+            ok = code == 0 or code == "0"
+            return ok, msg if msg else ("取消成功" if ok else "取消失败")
+        except Exception as exc:
+            return False, str(exc)
 
     def read_notice(self) -> bool:
         url = f"{BASE_URL}/modules/myAppointment/T_PUBLIC_PLACE_READ_SAVE.do"
