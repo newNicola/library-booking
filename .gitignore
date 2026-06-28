@@ -6,10 +6,8 @@ dist/
 build/
 cookies.json
 user_profile.json
+lib/config.json
 output.txt
 *.spec
 .claude/
 .agents/
-AI_HANDOFF_PROMPT.md
-PROJECT_CONTEXT.md
-新建 文本文档.txt
