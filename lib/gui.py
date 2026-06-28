@@ -27,7 +27,7 @@ import sys
 sys.path.insert(0, _LIB_DIR)
 
 from config import Config
-from api_client import APIClient, FloorInfo, SeatInfo, ViolationInfo, COOKIES_FILE
+from api_client import APIClient, FloorInfo, SeatInfo, ViolationInfo, COOKIES_FILE, PROFILE_FILE
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +478,43 @@ class BookingApp:
 
             with open(COOKIES_FILE, "w", encoding="utf-8") as f:
                 json.dump(cookies_flat, f, ensure_ascii=False, indent=2)
+
+            # Extract user profile from the page DOM
+            try:
+                user_info_el = page.query_selector(".bh-headerBar-userInfo-detail")
+                if user_info_el:
+                    text = user_info_el.inner_text()
+                    lines = [l.strip() for l in text.split("\n") if l.strip()]
+                    user_id = lines[0] if len(lines) > 0 else ""
+                    user_name = lines[1] if len(lines) > 1 else ""
+                    for ch in ["男", "女"]:
+                        if user_name.endswith(ch):
+                            user_name = user_name[:-1]
+                            break
+                    dept_name = lines[2] if len(lines) > 2 else ""
+                else:
+                    user_id = user_name = dept_name = ""
+
+                profile = {
+                    "USER_ID": user_id,
+                    "USER_NAME": user_name,
+                    "DEPT_CODE": "",
+                    "DEPT_NAME": dept_name,
+                    "PHONE_NUMBER": "",
+                    "SCHOOL_DISTRICT_CODE": "1",
+                    "SCHOOL_DISTRICT": "",
+                    "LOCATION": "",
+                    "PLACE_NAME": "",
+                }
+
+                with open(PROFILE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(profile, f, ensure_ascii=False, indent=2)
+                if user_id:
+                    self.queue.put(("result", f"用户信息已保存: {user_name} ({user_id})"))
+                else:
+                    self.queue.put(("result", f"用户信息已保存 (学号未提取到，但可手动填写 {PROFILE_FILE}，不影响使用)"))
+            except Exception as exc:
+                self.queue.put(("result", f"提取用户信息失败: {exc}"))
 
             context.close()
             browser.close()
