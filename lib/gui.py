@@ -400,8 +400,7 @@ class BookingApp:
         ok = self.threaded_api.load_cookie() and self.threaded_api.load_profile()
         if not ok:
             self.user_label.config(text="用户: 未登录")
-            self.log("未找到 Cookie，请先登录")
-            self._open_browser_login(initial=True)
+            self.log("未找到 Cookie，请先点击「刷新」登录")
             return
         self.user_label.config(text=f"用户: {self.threaded_api.get_user_name()} ({self.threaded_api.get_user_id()})")
         self.log(f"Cookie 已加载")
