@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.exe
+dist/
+build/
+cookies.json
+user_profile.json
+output.txt
+*.spec
+.claude/
+新建 文本文档.txt
