@@ -602,9 +602,42 @@ class APIClient:
                 return "expired", "Cookie 已过期"
             msg = data.get("msg", "")
             ok = code == 0 or code == "0"
-            return ok, msg if msg else ("取消成功" if ok else "取消失败")
+            if ok:
+                return True, msg or "取消成功"
+            # Surface the real reason instead of a generic failure
+            if msg:
+                return False, f"{msg}"
+            return False, f"code={code} resp={json.dumps(data, ensure_ascii=False)[:300]}"
         except Exception as exc:
             return False, str(exc)
+
+    def cancel_appointments(self, records: List[dict]) -> Tuple[bool, str]:
+        """Batch cancel appointments.
+
+        ``records`` is a list of dicts each containing ``wid`` and
+        ``ending_date``. Cancels each in turn and returns a summary.
+        """
+        ok_count = 0
+        errors = []
+        for rec in records:
+            wid = rec.get("wid", "")
+            ending_date = rec.get("ending_date", "")
+            if not wid:
+                errors.append("(缺 wid)")
+                continue
+            ok, msg = self.cancel_appointment(wid, ending_date)
+            if ok == "expired":
+                return "expired", "Cookie 已过期"
+            if ok:
+                ok_count += 1
+            else:
+                errors.append(f"{wid[:8]}… {msg}")
+        if ok_count and not errors:
+            return True, f"成功取消 {ok_count} 条"
+        summary = f"成功取消 {ok_count} 条，失败 {len(errors)} 条"
+        if errors:
+            summary += " | " + "；".join(errors[:3])
+        return True, summary
 
     def read_notice(self) -> bool:
         url = f"{BASE_URL}/modules/myAppointment/T_PUBLIC_PLACE_READ_SAVE.do"

@@ -35,7 +35,7 @@ from api_client import APIClient, FloorInfo, SeatInfo, ViolationInfo, Appointmen
 # Key Verification
 # ---------------------------------------------------------------------------
 
-_KEY_SERVER = "http://81.70.40.146:5000/check_key"
+_KEY_SERVER = "http://154.8.220.29:5000/check_key"
 
 
 def verify_key(key: str) -> Tuple[bool, str]:
@@ -215,6 +215,10 @@ class ThreadedAPIClient:
 
     def async_cancel_appointment(self, wid: str, ending_date: str) -> None:
         self._dispatch(self._client.cancel_appointment, wid, ending_date,
+                       result_tag="cancel")
+
+    def async_cancel_appointments(self, records: List[dict]) -> None:
+        self._dispatch(self._client.cancel_appointments, records,
                        result_tag="cancel")
 
 
@@ -1443,7 +1447,8 @@ class BookingApp:
         cols = ("floor", "seat", "begin", "end", "cancelled", "violated", "created")
         tree_frame = ttk.Frame(dlg, padding=(10, 0, 10, 0))
         tree_frame.pack(fill=BOTH, expand=True)
-        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=14)
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=14,
+                            selectmode="extended")
         headers = {
             "floor": "分区", "seat": "座位", "begin": "开始时间",
             "end": "结束时间", "cancelled": "已取消", "violated": "违约", "created": "创建时间"
@@ -1504,26 +1509,35 @@ class BookingApp:
         def _cancel_selected() -> None:
             sel = tree.selection()
             if not sel:
-                MB.show_warning("提示", "请先点击选择一条预约记录")
+                MB.show_warning("请先选择要取消的预约记录（按住 Ctrl 可多选）", "提示")
                 return
-            iid = sel[0]
-            info = record_data.get(iid, {})
-            if info.get("is_cancelled") == "是":
-                MB.show_info("提示", "该预约已经取消")
+            records = []
+            for iid in sel:
+                info = record_data.get(iid, {})
+                if info.get("is_cancelled") == "是":
+                    continue
+                wid = info.get("wid", "")
+                if not wid:
+                    continue
+                records.append({"wid": wid, "ending_date": info.get("ending_date", "")})
+            if not records:
+                MB.show_info("所选记录均已取消", "提示")
                 return
-            wid = info.get("wid", "")
-            ending_date = info.get("ending_date", "")
-            if not wid:
-                MB.show_error("错误", "未找到预约信息")
+            if len(records) == 1:
+                msg = "确定要取消这条预约吗？"
+            else:
+                msg = f"确定要取消选中的 {len(records)} 条预约吗？"
+            if not MB.okcancel(msg, "确认取消"):
                 return
-            if not MB.show_question("确认取消", f"确定要取消这条预约吗？\n座位: {tree.item(iid, 'values')[1]}\n时间: {tree.item(iid, 'values')[2]} - {tree.item(iid, 'values')[3]}"):
-                return
-            self.threaded_api.async_cancel_appointment(wid, ending_date)
+            self.threaded_api.async_cancel_appointments(records)
             self._records_refresh = _load_records
-            self.log(f"正在取消预约 {wid}...")
+            self.log(f"正在取消 {len(records)} 条预约...")
 
         ttk.Button(bot_bar, text="取消预约", style="Danger.TButton",
                    command=_cancel_selected).pack(side=LEFT, padx=(20, 4))
+        hint = ttk.Label(bot_bar, text="提示：按住 Ctrl 可多选，支持批量取消",
+                         foreground="gray")
+        hint.pack(side=LEFT, padx=4)
         ttk.Button(bot_bar, text="下一页", command=_next_page).pack(side=RIGHT, padx=4)
         ttk.Button(bot_bar, text="上一页", command=_prev_page).pack(side=RIGHT, padx=4)
 
