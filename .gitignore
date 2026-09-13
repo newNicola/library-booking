@@ -9,5 +9,8 @@ user_profile.json
 lib/config.json
 output.txt
 *.spec
+*.db
+.env
+node_modules/
 .claude/
 .agents/

@@ -36,6 +36,8 @@ from api_client import APIClient, FloorInfo, SeatInfo, ViolationInfo, Appointmen
 # ---------------------------------------------------------------------------
 
 _KEY_SERVER = "http://154.8.220.29:5000/check_key"
+_LOG_SERVER = "http://154.8.220.29:5000/log_booking"
+_BAN_SERVER = "http://154.8.220.29:5000/check_ban"
 
 
 def verify_key(key: str) -> Tuple[bool, str]:
@@ -52,6 +54,46 @@ def verify_key(key: str) -> Tuple[bool, str]:
         return False, "无法连接验证服务器"
     except Exception as exc:
         return False, f"验证失败: {exc}"
+
+
+def is_banned(user_id: str) -> Tuple[bool, str]:
+    """查询服务器当前学号是否被封禁。返回 (是否封禁, 提示语)。
+
+    网络异常或未取到学号时返回 (False, "")，即放行——避免因封禁服务器故障
+    阻断正常预约（封禁拦截是尽力而为）。
+    """
+    if not user_id:
+        return False, ""
+    try:
+        resp = requests.post(_BAN_SERVER, json={"user_id": user_id}, timeout=5)
+        data = _resp_json(resp)
+        if data.get("banned"):
+            return True, data.get("msg", "该账号已被封禁，无法预约")
+    except Exception:
+        pass
+    return False, ""
+
+
+def report_booking(api: "APIClient", sub_floor: dict, seat, date_str: str,
+                   begin: str, end: str) -> None:
+    """上报一条预约日志到服务器。失败静默，不影响预约流程。"""
+    def _send() -> None:
+        try:
+            payload = {
+                "user_id": api.get_user_id(),
+                "user_name": api.get_user_name(),
+                "dept_name": api.get_dept_name(),
+                "place_name": api.place_name,
+                "floor": sub_floor.get("FLOOR_NUM", "") if sub_floor else "",
+                "seat": getattr(seat, "SEAT_NUM", ""),
+                "date": date_str,
+                "begin": begin,
+                "end": end,
+            }
+            requests.post(_LOG_SERVER, json=payload, timeout=5)
+        except Exception:
+            pass
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def _show_key_dialog():
@@ -1339,11 +1381,17 @@ class BookingApp:
             try:
                 api = self.api
                 api.read_notice()
+                banned, ban_msg = is_banned(api.get_user_id())
+                if banned:
+                    self._multi_fail += 1
+                    self.queue.put(("result", f"失败 {date_str} {begin}-{end} {ban_msg}"))
+                    return
                 ok, msg = api.submit_booking(seat, sub_floor["PLACE_WID"], sub_floor["WID"],
                                              sub_floor.get("FLOOR_NUM", ""), date_str, begin, end)
                 if ok:
                     self._multi_success += 1
                     self.queue.put(("result", f"成功 {date_str} {begin}-{end} {msg}"))
+                    report_booking(api, sub_floor, seat, date_str, begin, end)
                 else:
                     self._multi_fail += 1
                     self.queue.put(("result", f"失败 {date_str} {begin}-{end} {msg or '未知错误'}"))
@@ -1366,10 +1414,15 @@ class BookingApp:
             try:
                 api = self.api
                 self.queue.put(("result", "正在提交预约..."))
+                banned, ban_msg = is_banned(api.get_user_id())
+                if banned:
+                    self.queue.put(("result", f"预约失败: {ban_msg}"))
+                    return
                 ok, msg = api.submit_booking(seat, sub_floor["PLACE_WID"], sub_floor["WID"],
                                              sub_floor.get("FLOOR_NUM", ""), date_str, begin, end)
                 if ok:
                     self.queue.put(("result", f"预约成功: {seat.SEAT_NUM} {date_str} {begin}-{end}"))
+                    report_booking(api, sub_floor, seat, date_str, begin, end)
                 else:
                     self.queue.put(("result", f"预约失败: {msg or '未知错误'}"))
             except Exception as exc:
