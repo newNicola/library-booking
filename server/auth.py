@@ -7,7 +7,7 @@ import jwt
 from flask import g, jsonify, request
 from werkzeug.security import check_password_hash, generate_password_hash
 
-import config
+from . import config
 
 
 def hash_password(password: str) -> str:
@@ -46,3 +46,5 @@ def login_required(fn):
         g.admin_username = payload.get("sub", "")
         return fn(*args, **kwargs)
     return wrapper
+
+

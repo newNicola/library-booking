@@ -14,12 +14,12 @@
 
 import hmac
 import os
+import unicodedata
+from datetime import date, datetime
 
 from flask import Flask, g, jsonify, request, send_from_directory
 
-import auth
-import config
-import db
+from . import auth, config, db
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DIST_DIR = os.path.join(BASE_DIR, "frontend", "dist")
@@ -32,6 +32,50 @@ def _json(data, code=200):
     return jsonify(data), code
 
 
+def _clean_text(data: dict, field: str, max_length: int) -> str:
+    if not isinstance(data, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+    value = data.get(field, "")
+    if value is None:
+        return ""
+    if not isinstance(value, (str, int)):
+        raise ValueError(f"{field} 格式错误")
+    value = str(value).strip()
+    if len(value) > max_length:
+        raise ValueError(f"{field} 超出长度限制")
+    return value
+
+
+def _validate_date(value: str) -> str:
+    date.fromisoformat(value)
+    return value
+
+
+def _validate_time(value: str) -> str:
+    datetime.strptime(value, "%H:%M")
+    return value
+
+
+def _validate_optional_datetime(value: str) -> str:
+    if value:
+        datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    return value
+
+
+def _normalize_license_key(value: str) -> str:
+    return "".join(
+        ch for ch in str(value or "")
+        if not ch.isspace() and unicodedata.category(ch) != "Cf"
+    )
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    parts = str(value or "").strip().split(".")
+    if not parts or any(not part.isdigit() for part in parts):
+        raise ValueError("版本号格式错误")
+    return tuple(int(part) for part in parts)
+
+
 # ---------------------------------------------------------------------------
 # 公开接口（兼容客户端，无鉴权）
 # ---------------------------------------------------------------------------
@@ -39,23 +83,38 @@ def _json(data, code=200):
 @app.route("/check_key", methods=["POST"])
 def check_key():
     data = request.get_json(silent=True) or {}
-    key = (data.get("key") or "").strip()
+    try:
+        key = _normalize_license_key(_clean_text(data, "key", 512))
+        client_version = _clean_text(data, "version", 32)
+        if _version_tuple(client_version) < _version_tuple(config.MIN_CLIENT_VERSION):
+            return _json({
+                "status": "fail",
+                "msg": f"当前版本已停止使用，请升级到 V{config.MIN_CLIENT_VERSION} 或更高版本",
+            })
+    except ValueError as exc:
+        return _json({"status": "fail", "msg": str(exc)}, 400)
 
-    stored = db.get_license_key()
+    stored = _normalize_license_key(db.get_license_key())
     if not stored:
         return _json({"status": "error", "msg": "服务器未配置密钥"}, 500)
 
     if not (key and hmac.compare_digest(key, stored)):
         return _json({"status": "fail", "msg": "密钥无效"})
 
-    return _json({"status": "ok", "msg": "验证成功"})
+    return _json({
+        "status": "ok",
+        "msg": "验证成功",
+    })
 
 
 @app.route("/check_ban", methods=["POST"])
 def check_ban():
     """客户端提交预约前查询当前学号是否被封禁。"""
     data = request.get_json(silent=True) or {}
-    user_id = (data.get("user_id") or "").strip()
+    try:
+        user_id = _clean_text(data, "user_id", 64)
+    except (AttributeError, ValueError) as exc:
+        return _json({"status": "fail", "msg": str(exc)}, 400)
     if not user_id:
         return _json({"status": "ok", "banned": False})
     if db.is_banned(user_id):
@@ -66,18 +125,34 @@ def check_ban():
 @app.route("/log_booking", methods=["POST"])
 def log_booking():
     data = request.get_json(silent=True) or {}
-    if not data.get("date") and not data.get("seat"):
-        return _json({"status": "fail", "msg": "缺少预约信息"}, 400)
     try:
-        db.insert_booking(data)
-    except Exception as exc:
-        return _json({"status": "error", "msg": f"写入失败: {exc}"}, 500)
+        payload = {
+            "user_id": _clean_text(data, "user_id", 64),
+            "user_name": _clean_text(data, "user_name", 128),
+            "dept_name": _clean_text(data, "dept_name", 128),
+            "place_name": _clean_text(data, "place_name", 128),
+            "floor": _clean_text(data, "floor", 64),
+            "seat": _clean_text(data, "seat", 64),
+            "date": _validate_date(_clean_text(data, "date", 10)),
+            "begin": _validate_time(_clean_text(data, "begin", 5)),
+            "end": _validate_time(_clean_text(data, "end", 5)),
+        }
+        if not payload["seat"]:
+            raise ValueError("缺少座位信息")
+        db.insert_booking(payload)
+    except ValueError as exc:
+        return _json({"status": "fail", "msg": str(exc)}, 400)
+    except Exception:
+        app.logger.exception("booking log write failed")
+        return _json({"status": "error", "msg": "写入失败"}, 500)
     return _json({"status": "ok", "msg": "已记录"})
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return _json({"status": "ok", "msg": "alive"})
+    if db.check_health():
+        return _json({"status": "ok", "msg": "ready"})
+    return _json({"status": "error", "msg": "database unavailable"}, 503)
 
 
 @app.route("/logs", methods=["GET"])
@@ -114,8 +189,13 @@ th{{background:#f5f5f5}}small{{color:#888}}</style></head><body>
 @app.route("/api/auth/login", methods=["POST"])
 def api_login():
     data = request.get_json(silent=True) or {}
-    username = (data.get("username") or "").strip()
+    try:
+        username = _clean_text(data, "username", 64)
+    except (AttributeError, ValueError) as exc:
+        return _json({"status": "fail", "msg": str(exc)}, 400)
     password = data.get("password") or ""
+    if not isinstance(password, str) or len(password) > 512:
+        return _json({"status": "fail", "msg": "密码格式错误"}, 400)
     row = db.get_admin(username)
     if row is None or not auth.check_password(row[2], password):
         return _json({"status": "fail", "msg": "用户名或密码错误"}, 401)
@@ -155,9 +235,16 @@ def api_put_key():
 def api_logs():
     page = max(1, request.args.get("page", 1, type=int))
     page_size = min(100, max(1, request.args.get("page_size", 20, type=int)))
-    user_id = request.args.get("user_id", "").strip()
+    user_id = request.args.get("user_id", "").strip()[:64]
     date_from = request.args.get("date_from", "").strip()
     date_to = request.args.get("date_to", "").strip()
+    try:
+        if date_from:
+            _validate_date(date_from)
+        if date_to:
+            _validate_date(date_to)
+    except ValueError:
+        return _json({"status": "fail", "msg": "日期格式应为 YYYY-MM-DD"}, 400)
     total, rows = db.list_bookings(page, page_size, user_id, date_from, date_to)
     return _json({
         "status": "ok", "total": total, "page": page,
@@ -170,7 +257,7 @@ def api_logs():
 def api_list_bans():
     page = max(1, request.args.get("page", 1, type=int))
     page_size = min(100, max(1, request.args.get("page_size", 20, type=int)))
-    keyword = request.args.get("keyword", "").strip()
+    keyword = request.args.get("keyword", "").strip()[:64]
     total, rows = db.list_bans(page, page_size, keyword)
     return _json({"status": "ok", "total": total, "page": page, "rows": rows})
 
@@ -179,15 +266,18 @@ def api_list_bans():
 @auth.login_required
 def api_add_ban():
     data = request.get_json(silent=True) or {}
-    user_id = (data.get("user_id") or "").strip()
+    try:
+        user_id = _clean_text(data, "user_id", 64)
+    except (AttributeError, ValueError) as exc:
+        return _json({"status": "fail", "msg": str(exc)}, 400)
     if not user_id:
         return _json({"status": "fail", "msg": "学号不能为空"}, 400)
-    ban_id = db.add_ban(
-        user_id,
-        (data.get("reason") or "").strip(),
-        (data.get("expires_at") or "").strip(),
-        g.admin_username,
-    )
+    try:
+        reason = _clean_text(data, "reason", 255)
+        expires_at = _validate_optional_datetime(_clean_text(data, "expires_at", 19))
+    except ValueError as exc:
+        return _json({"status": "fail", "msg": str(exc)}, 400)
+    ban_id = db.add_ban(user_id, reason, expires_at, g.admin_username)
     return _json({"status": "ok", "id": ban_id})
 
 
@@ -196,20 +286,30 @@ def api_add_ban():
 def api_update_ban(ban_id):
     data = request.get_json(silent=True) or {}
     fields = {}
-    if "reason" in data:
-        fields["reason"] = data["reason"]
-    if "expires_at" in data:
-        fields["expires_at"] = data["expires_at"] or None
+    try:
+        if "reason" in data:
+            fields["reason"] = _clean_text(data, "reason", 255)
+        if "expires_at" in data:
+            value = _validate_optional_datetime(_clean_text(data, "expires_at", 19))
+            fields["expires_at"] = value or None
+    except ValueError as exc:
+        return _json({"status": "fail", "msg": str(exc)}, 400)
     if "is_active" in data:
+        if not isinstance(data["is_active"], bool):
+            return _json({"status": "fail", "msg": "is_active 必须为布尔值"}, 400)
         fields["is_active"] = 1 if data["is_active"] else 0
-    db.update_ban(ban_id, **fields)
+    if not fields:
+        return _json({"status": "fail", "msg": "没有可更新字段"}, 400)
+    if not db.update_ban(ban_id, **fields):
+        return _json({"status": "fail", "msg": "封禁记录不存在"}, 404)
     return _json({"status": "ok"})
 
 
 @app.route("/api/bans/<int:ban_id>", methods=["DELETE"])
 @auth.login_required
 def api_delete_ban(ban_id):
-    db.delete_ban(ban_id)
+    if not db.delete_ban(ban_id):
+        return _json({"status": "fail", "msg": "封禁记录不存在"}, 404)
     return _json({"status": "ok"})
 
 
@@ -227,7 +327,9 @@ def api_stats():
 @app.route("/<path:path>")
 def spa(path):
     # API / 公开接口不在静态托管范围内
-    if path.startswith(("api/", "check_key", "log_booking", "health", "logs")):
+    if path.startswith((
+        "api/", "check_key", "log_booking", "health", "logs"
+    )):
         return _json({"status": "fail", "msg": "Not Found"}, 404)
 
     if path and os.path.isfile(os.path.join(DIST_DIR, path)):
@@ -242,10 +344,3 @@ def spa(path):
 if __name__ == "__main__":
     db.init_db()
     app.run(host="0.0.0.0", port=5000, debug=False)
-else:
-    # gunicorn 等 WSGI 环境下，导入时初始化（建表 + 播种，幂等）
-    try:
-        db.init_db()
-    except Exception as exc:  # DB 未就绪时不阻断进程启动，接口会报错
-        import logging
-        logging.getLogger(__name__).error("init_db failed: %s", exc)

@@ -5,8 +5,6 @@
 > **认证方式：** Cookie（通过 Playwright 驱动 Edge 浏览器登录 CAS 后自动获取并持久化到 `cookies.json`）
 > **请求格式：** `application/x-www-form-urlencoded; charset=UTF-8`
 
----
-
 ## 目录
 
 1. [登录与认证](#1-登录与认证)

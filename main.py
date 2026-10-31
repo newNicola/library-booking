@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-数图预约 v2.0 - 河北农业大学图书馆座位预约工具
+数图预约 V6.0 - 河北农业大学图书馆座位预约工具
 
 Entry point. Verifies license key, creates the APIClient, loads cookies/profile,
 then launches the GUI.
 """
 
-import os
 import sys
 
 # Hide console window on Windows immediately after startup
@@ -19,12 +18,10 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Ensure the lib directory is on the path
-_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
-if _LIB_DIR not in sys.path:
-    sys.path.insert(0, _LIB_DIR)
+from lib.app_logging import configure_logging
+from lib.gui import _build_main_app, _show_key_dialog
 
-from gui import BookingApp, _show_key_dialog, _build_main_app
+configure_logging()
 
 
 def main() -> None:

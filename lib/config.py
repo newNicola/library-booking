@@ -8,13 +8,20 @@ typed accessors for every user-adjustable parameter.
 import json
 import os
 import sys
+from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from .storage import DATA_DIR, atomic_write_json
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-# When packaged as exe, config lives next to the executable
-_CONFIG_DIR = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, 'frozen', False) else APP_DIR
-CONFIG_FILE = os.path.join(_CONFIG_DIR, "config.json")
+CONFIG_FILE = str(DATA_DIR / "config.json")
+_LEGACY_CONFIG_DIR = (
+    os.path.dirname(os.path.abspath(sys.executable))
+    if getattr(sys, "frozen", False)
+    else APP_DIR
+)
+LEGACY_CONFIG_FILE = os.path.join(_LEGACY_CONFIG_DIR, "config.json")
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "date_range_days": 7,
@@ -35,30 +42,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "window_height": 700,
     "window_x": None,
     "window_y": None,
-    "theme": "superhero",
+    "theme": "flatly",
 }
 
 
 def _load() -> Dict[str, Any]:
-    if os.path.exists(CONFIG_FILE):
+    source = CONFIG_FILE if os.path.exists(CONFIG_FILE) else LEGACY_CONFIG_FILE
+    if os.path.exists(source):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+            with open(source, "r", encoding="utf-8-sig") as f:
                 saved: Dict[str, Any] = json.load(f)
-            merged = DEFAULT_CONFIG.copy()
+            if not isinstance(saved, dict):
+                raise ValueError("config root must be an object")
+            merged = deepcopy(DEFAULT_CONFIG)
             merged.update(saved)
+            merged["date_range_days"] = min(30, max(1, int(merged["date_range_days"])))
+            if not isinstance(merged.get("time_slots"), list) or not merged["time_slots"]:
+                merged["time_slots"] = deepcopy(DEFAULT_CONFIG["time_slots"])
+            if source != CONFIG_FILE:
+                try:
+                    _save(merged)
+                except OSError:
+                    pass  # Reading legacy settings is still better than discarding them.
             return merged
-        except Exception:
-            pass
-    return DEFAULT_CONFIG.copy()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return deepcopy(DEFAULT_CONFIG)
+    return deepcopy(DEFAULT_CONFIG)
 
 
 def _save(cfg: Dict[str, Any]) -> None:
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    atomic_write_json(CONFIG_FILE, cfg)
 
 
 class Config:
-    """Thread-safe-ish config accessor backed by a JSON file."""
+    """Validated config accessor backed by an atomically written JSON file."""
 
     def __init__(self) -> None:
         self._data = _load()
@@ -106,11 +123,11 @@ class Config:
 
     @property
     def theme(self) -> str:
-        return self._data.get("theme", "superhero")
+        return self._data.get("theme", "flatly")
 
     # -- setters (persist immediately) --
     def set_date_range_days(self, value: int) -> None:
-        self._data["date_range_days"] = value
+        self._data["date_range_days"] = min(30, max(1, int(value)))
         _save(self._data)
 
     def set_auto_grab_interval_ms(self, value: int) -> None:

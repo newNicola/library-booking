@@ -4,7 +4,7 @@ Flask + MySQL + Vue3 后端，单端口同源部署，接口：
 
 - `POST /check_key` — 客户端授权密钥验证（兼容老接口，新增 `user_id` 封禁检查）
 - `POST /log_booking` — 客户端上报预约日志
-- `GET /health` — 健康检查
+- `GET /health` — 就绪检查（包含数据库连接检测）
 - `/api/*` — 后台管理接口（JWT 鉴权）
 - `/` — 托管 Vue3 后台管理页面（SPA）
 
@@ -64,9 +64,18 @@ JWT_SECRET=一段足够长的随机字符串
 LICENSE_KEY=旧key原样
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=管理员的强密码
+MIN_CLIENT_VERSION=6.0
 ```
 
-> 首次启动时：`init_db()` 自动建表，并把 `LICENSE_KEY` 写入 `app_config` 表；若 `admins` 表为空且设置了 `ADMIN_USERNAME/PASSWORD`，则创建首个管理员账号。之后改密钥在后台页面操作即可，无需再动环境变量。
+> 首次启动时：`init_db()` 自动建表，并把 `LICENSE_KEY` 写入 `app_config` 表；若 `admins` 表为空且设置了 `ADMIN_USERNAME/PASSWORD`，则创建首个管理员账号。之后改密钥在后台页面操作即可，无需再动环境变量。数据库不可用时服务会快速启动失败，避免出现进程存活但接口不可用的假健康状态。
+
+已有部署升级时，先备份数据库并依次执行：
+
+```bash
+mysql -u library_app -p library_seat < server/migrations/001_booking_temporal_types.sql
+```
+
+新安装由 `init_db()` 自动创建完整表结构，不需要手动执行迁移。
 
 ### 4. 构建前端
 
@@ -79,11 +88,11 @@ npm run build     # 产物输出到 frontend/dist，Flask 直接托管
 ### 5. 启动
 
 ```bash
-# 本地/开发
-cd server && python app.py
+# 本地/开发（在项目根目录）
+python -m server.app
 
-# 生产（gunicorn + systemd）
-gunicorn -w 2 -b 0.0.0.0:5000 app:app
+# 生产（gunicorn + systemd，在项目根目录）
+gunicorn -w 2 -b 127.0.0.1:5000 server.wsgi:app
 ```
 
 systemd 示例 `/etc/systemd/system/license.service`：
@@ -94,9 +103,9 @@ Description=Library Seat Booking Server
 After=network.target
 
 [Service]
-WorkingDirectory=/opt/license-server
-EnvironmentFile=/opt/license-server/.env
-ExecStart=/opt/license-server/venv/bin/gunicorn -w 2 -b 0.0.0.0:5000 app:app
+WorkingDirectory=/opt/library-booking
+EnvironmentFile=/opt/library-booking/server/.env
+ExecStart=/opt/library-booking/venv/bin/gunicorn -w 2 -b 127.0.0.1:5000 server.wsgi:app
 Restart=always
 
 [Install]
@@ -110,7 +119,8 @@ sudo systemctl enable --now license
 
 ### 6. 防火墙
 
-云厂商安全组放行 TCP `5000`（HTTPS 则放行 `443`）。
+当前客户端允许直接连接 `http://154.8.220.29:5000`。仍建议后续使用 Nginx/Caddy
+反向代理并配置 HTTPS；升级后公网仅需放行 `443`。
 
 ## 后台使用
 
@@ -118,12 +128,11 @@ sudo systemctl enable --now license
 
 ## 客户端配套改动
 
-客户端 `lib/gui.py` 在提交预约前调用 `/check_ban` 查询当前学号是否被封禁，封禁则拒绝预约。服务端地址改法：
+客户端在提交预约前调用 `/check_ban` 查询当前学号是否被封禁，封禁则拒绝预约。
+服务端地址通过环境变量统一配置：
 
-```python
-_KEY_SERVER = "http://新服务器IP:5000/check_key"
-_LOG_SERVER = "http://新服务器IP:5000/log_booking"
-_BAN_SERVER = "http://新服务器IP:5000/check_ban"
+```ini
+LIBRARY_CONTROL_SERVER=http://154.8.220.29:5000
 ```
 
 改完重新打包 exe。
@@ -132,5 +141,5 @@ _BAN_SERVER = "http://新服务器IP:5000/check_ban"
 
 - `.env` 含数据库密码与 JWT 密钥，绝不提交 git（已在 `.gitignore`）。
 - `JWT_SECRET` 必须设强随机值，否则 token 可被伪造。
-- `/check_key`、`/log_booking`、`/check_ban` 目前无鉴权（客户端无需登录），公网建议加 HTTPS 与限流。
+- `/check_key`、`/log_booking`、`/check_ban` 仍为兼容接口，公网需要限流；整个站点必须启用 HTTPS。
 - 封禁在客户端提交预约前检查（用户确认的模型），属尽力而为：封禁服务器故障或学号缺失时放行，不影响正常预约。

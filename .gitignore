@@ -9,6 +9,7 @@ user_profile.json
 lib/config.json
 output.txt
 *.spec
+!数图预约V4.0.spec
 *.db
 .env
 node_modules/

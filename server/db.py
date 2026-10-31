@@ -8,15 +8,26 @@ import datetime
 import logging
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 
-import config
+from . import config
 
 log = logging.getLogger(__name__)
 
 engine = create_engine(
-    config.SQLALCHEMY_DATABASE_URI,
+    URL.create(
+        "mysql+pymysql",
+        username=config.DB_USER,
+        password=config.DB_PASSWORD,
+        host=config.DB_HOST,
+        port=int(config.DB_PORT),
+        database=config.DB_NAME,
+        query={"charset": "utf8mb4"},
+    ),
     pool_pre_ping=True,
     pool_recycle=3600,
+    pool_timeout=10,
+    connect_args={"connect_timeout": 5},
     echo=False,
 )
 
@@ -52,11 +63,11 @@ def init_db() -> None:
           place_name VARCHAR(128) NULL,
           floor      VARCHAR(64)  NULL,
           seat       VARCHAR(64)  NULL,
-          date       VARCHAR(32)  NULL,
-          begin      VARCHAR(8)   NULL,
-          end        VARCHAR(8)   NULL,
+          date       DATE         NULL,
+          begin      TIME         NULL,
+          end        TIME         NULL,
           KEY idx_user_id    (user_id),
-          KEY idx_date       (date),
+          KEY idx_date_id    (date, id),
           KEY idx_created_at (created_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
@@ -93,7 +104,7 @@ def init_db() -> None:
 
         # 播种管理员：admins 表为空且设置了 ADMIN_USERNAME/PASSWORD
         if config.ADMIN_USERNAME and config.ADMIN_PASSWORD:
-            from auth import hash_password
+            from .auth import hash_password
 
             exists = conn.execute(
                 text("SELECT 1 FROM admins LIMIT 1")
@@ -118,6 +129,16 @@ def init_db() -> None:
                     "ADMIN_USERNAME=%s 不存在且 admins 表非空，跳过播种",
                     config.ADMIN_USERNAME,
                 )
+
+
+def check_health() -> bool:
+    """Return whether the database can serve a trivial query."""
+    try:
+        with engine.connect() as conn:
+            return conn.execute(text("SELECT 1")).scalar() == 1
+    except Exception:
+        log.exception("database health check failed")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +183,18 @@ def insert_booking(payload: dict) -> None:
         conn.execute(text(f"INSERT INTO bookings ({cols}) VALUES ({phs})"), values)
 
 
+def _serialize_row(row) -> dict:
+    result = dict(row)
+    for key, value in result.items():
+        if isinstance(value, datetime.datetime):
+            result[key] = value.isoformat(sep=" ", timespec="seconds")
+        elif isinstance(value, datetime.time):
+            result[key] = value.isoformat(timespec="minutes")
+        elif isinstance(value, datetime.date):
+            result[key] = value.isoformat()
+    return result
+
+
 def list_bookings(page: int, page_size: int, user_id: str,
                   date_from: str, date_to: str) -> tuple:
     """返回 (total, rows)。rows 为 dict 列表。"""
@@ -169,7 +202,7 @@ def list_bookings(page: int, page_size: int, user_id: str,
     params = {}
     if user_id:
         where.append("user_id LIKE :user_id")
-        params["user_id"] = f"%{user_id}%"
+        params["user_id"] = f"{user_id}%"
     if date_from:
         where.append("date >= :date_from")
         params["date_from"] = date_from
@@ -192,7 +225,7 @@ def list_bookings(page: int, page_size: int, user_id: str,
             ),
             {**params, "limit": page_size, "offset": offset},
         ).mappings().all()
-        return total, [dict(r) for r in rows]
+        return total, [_serialize_row(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +251,7 @@ def list_bans(page: int, page_size: int, keyword: str) -> tuple:
     params = {}
     if keyword:
         where.append("user_id LIKE :kw")
-        params["kw"] = f"%{keyword}%"
+        params["kw"] = f"{keyword}%"
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
     with engine.connect() as conn:
@@ -228,12 +261,15 @@ def list_bans(page: int, page_size: int, keyword: str) -> tuple:
         offset = (page - 1) * page_size
         rows = conn.execute(
             text(
-                f"SELECT id, user_id, reason, is_active, expires_at, created_at, created_by "
+                f"SELECT id, user_id, reason, "
+                f"CASE WHEN is_active=1 AND (expires_at IS NULL OR expires_at > NOW()) "
+                f"THEN 1 ELSE 0 END AS is_active, "
+                f"expires_at, created_at, created_by "
                 f"FROM bans{where_sql} ORDER BY id DESC LIMIT :limit OFFSET :offset"
             ),
             {**params, "limit": page_size, "offset": offset},
         ).mappings().all()
-        return total, [dict(r) for r in rows]
+        return total, [_serialize_row(r) for r in rows]
 
 
 def add_ban(user_id: str, reason: str, expires_at: str, created_by: str) -> int:
@@ -262,23 +298,25 @@ def add_ban(user_id: str, reason: str, expires_at: str, created_by: str) -> int:
         return existing[0]
 
 
-def update_ban(ban_id: int, **fields) -> None:
+def update_ban(ban_id: int, **fields) -> bool:
     allowed = {"reason", "expires_at", "is_active"}
     sets = [f"{k}=:{k}" for k in fields if k in allowed]
     if not sets:
-        return
+        return False
     params = {k: v for k, v in fields.items() if k in allowed}
     params["id"] = ban_id
     with engine.begin() as conn:
-        conn.execute(
+        result = conn.execute(
             text(f"UPDATE bans SET {', '.join(sets)} WHERE id=:id"), params
         )
+        return result.rowcount > 0
 
 
-def delete_ban(ban_id: int) -> None:
+def delete_ban(ban_id: int) -> bool:
     """软删：置 is_active=0。"""
     with engine.begin() as conn:
-        conn.execute(text("UPDATE bans SET is_active=0 WHERE id=:id"), {"id": ban_id})
+        result = conn.execute(text("UPDATE bans SET is_active=0 WHERE id=:id"), {"id": ban_id})
+        return result.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +362,10 @@ def get_stats() -> dict:
             text("SELECT COUNT(*) FROM bookings")
         ).scalar()
         active_bans = conn.execute(
-            text("SELECT COUNT(*) FROM bans WHERE is_active=1")
+            text(
+                "SELECT COUNT(*) FROM bans WHERE is_active=1 "
+                "AND (expires_at IS NULL OR expires_at > NOW())"
+            )
         ).scalar()
         total_bans = conn.execute(
             text("SELECT COUNT(*) FROM bans")

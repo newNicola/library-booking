@@ -7,20 +7,40 @@ Cookie handling is automatic from cookies.json.
 """
 
 import json
+import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple, TypeAlias, Union
 
 import requests
 
+from .storage import DATA_DIR, read_sensitive_json, write_sensitive_json
+from .sub_floor_fallback import get_fallback_sub_floors
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_URL = "https://ehall.hebau.edu.cn/qljfwapp/sys/lwAppointmentPublicPlace"
-# When packaged as exe, user files live next to the executable
-_USER_DIR = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, 'frozen', False) else os.path.join(APP_DIR, "..")
-COOKIES_FILE = os.path.join(_USER_DIR, "cookies.json")
-PROFILE_FILE = os.path.join(_USER_DIR, "user_profile.json")
+COOKIES_FILE = str(DATA_DIR / "cookies.json")
+PROFILE_FILE = str(DATA_DIR / "user_profile.json")
+_LEGACY_USER_DIR = (
+    os.path.dirname(os.path.abspath(sys.executable))
+    if getattr(sys, "frozen", False)
+    else os.path.abspath(os.path.join(APP_DIR, ".."))
+)
+_LEGACY_COOKIES_FILE = os.path.join(_LEGACY_USER_DIR, "cookies.json")
+_LEGACY_PROFILE_FILE = os.path.join(_LEGACY_USER_DIR, "user_profile.json")
+log = logging.getLogger(__name__)
+ApiStatus: TypeAlias = Union[bool, Literal["expired"]]
+
+
+class SessionExpiredError(ValueError):
+    """The upstream returned a login page or an empty unauthenticated response."""
+
+
+class InvalidResponseError(ValueError):
+    """The upstream response was neither valid JSON nor an authentication redirect."""
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -31,8 +51,7 @@ _HEADERS = {
 }
 
 def _load_json(path: str) -> dict:
-    with open(path, "r", encoding="utf-8-sig") as f:
-        return json.load(f)
+    return read_sensitive_json(path)
 
 def _now_ts() -> str:
     return str(int(time.time() * 1000))
@@ -46,9 +65,67 @@ def _normalize_hhmm(value: str) -> str:
 
 
 def _resp_json(resp: requests.Response):
-    """Parse JSON from response, handling UTF-8 BOM robustly."""
-    content = resp.content.lstrip()
-    return json.loads(content.decode('utf-8-sig'))
+    """Parse JSON and turn HTML/login responses into an authentication signal."""
+    try:
+        text = resp.content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise InvalidResponseError("学校接口返回了无法解码的数据") from exc
+    text = text.lstrip("\ufeff \t\r\n")
+    response_url = str(getattr(resp, "url", "")).lower()
+    prefix = text[:256].lower()
+    if (
+        not text
+        or "authserver/login" in response_url
+        or prefix.startswith("<!doctype html")
+        or prefix.startswith("<html")
+    ):
+        raise SessionExpiredError("Cookie 已过期")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        content_type = getattr(resp, "headers", {}).get("Content-Type", "unknown")
+        raise InvalidResponseError(f"学校接口返回非 JSON 数据 ({content_type})") from exc
+
+
+def _decode_response_text(resp: requests.Response) -> str:
+    try:
+        return resp.content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return resp.text
+
+
+def _compact_response_text(text: str, limit: int = 220) -> str:
+    compact = " ".join((text or "").replace("\ufeff", "").split())
+    return compact[:limit]
+
+
+def _looks_like_login_response(resp: requests.Response, text: str) -> bool:
+    response_url = str(getattr(resp, "url", "")).lower()
+    body = (text or "").lstrip("\ufeff \t\r\n")
+    body_lower = body[:2000].lower()
+    login_markers = (
+        "authserver/login",
+        "cas.hebau.edu.cn",
+        "loginform",
+        "统一身份认证",
+        "用户登录",
+        "请登录",
+    )
+    return (
+        not body.strip()
+        or "authserver/login" in response_url
+        or any(marker in body_lower for marker in login_markers)
+    )
+
+
+def _stringify_message(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False)
 
 
 class FloorInfo:
@@ -128,12 +205,22 @@ class APIClient:
         self.session.headers.update(_HEADERS)
         self.user_profile: Dict[str, str] = {}
         self._cookie_loaded = False
+        self._session_lock = threading.RLock()
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Serialize access to requests.Session, which is shared by GUI workers."""
+        with self._session_lock:
+            return self.session.request(method, url, **kwargs)
+
+    def _mark_expired(self) -> None:
+        self._cookie_loaded = False
 
     def load_cookie(self) -> bool:
-        if not os.path.exists(COOKIES_FILE):
+        source = COOKIES_FILE if os.path.exists(COOKIES_FILE) else _LEGACY_COOKIES_FILE
+        if not os.path.exists(source):
             return False
         try:
-            cookies_data = _load_json(COOKIES_FILE)
+            cookies_data = _load_json(source)
             # Playwright storage_state format: {"cookies": [{...}, ...]}
             if "cookies" in cookies_data:
                 for c in cookies_data["cookies"]:
@@ -148,19 +235,44 @@ class APIClient:
                 # Legacy format: {"name": "value", ...}
                 for name, value in cookies_data.items():
                     self.session.cookies.set(name, value, domain=".ehall.hebau.edu.cn")
+            if source != COOKIES_FILE:
+                try:
+                    write_sensitive_json(COOKIES_FILE, cookies_data)
+                except OSError:
+                    log.warning("could not migrate legacy cookie file", exc_info=True)
             self._cookie_loaded = True
             return True
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            log.warning("failed to load cookie file %s: %s", source, exc)
             return False
 
     def load_profile(self) -> bool:
-        if not os.path.exists(PROFILE_FILE):
+        source = PROFILE_FILE if os.path.exists(PROFILE_FILE) else _LEGACY_PROFILE_FILE
+        if not os.path.exists(source):
             return False
         try:
-            self.user_profile = _load_json(PROFILE_FILE)
+            self.user_profile = _load_json(source)
+            if source != PROFILE_FILE:
+                try:
+                    write_sensitive_json(PROFILE_FILE, self.user_profile)
+                except OSError:
+                    log.warning("could not migrate legacy profile file", exc_info=True)
             return True
-        except Exception:
+        except (OSError, ValueError, TypeError) as exc:
+            log.warning("failed to load profile file %s: %s", source, exc)
             return False
+
+    def logout(self) -> None:
+        """Clear the in-memory session and persisted login data."""
+        self.session.cookies.clear()
+        self.user_profile = {}
+        self._cookie_loaded = False
+        for path in {COOKIES_FILE, PROFILE_FILE, _LEGACY_COOKIES_FILE, _LEGACY_PROFILE_FILE}:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                log.warning("failed to remove login data %s", path, exc_info=True)
 
     # -- user info helpers --
     def get_user_id(self) -> str:
@@ -190,10 +302,11 @@ class APIClient:
 
     # -- API methods --
 
-    def get_floors(self) -> Tuple[bool, List[FloorInfo]]:
+    def get_floors(self) -> Tuple[ApiStatus, Union[List[FloorInfo], str]]:
         url = f"{BASE_URL}/modules/myAppointment/getFloorData.do"
         try:
-            resp = self.session.post(url, timeout=15)
+            resp = self._request("POST", url, timeout=15)
+            resp.raise_for_status()
             data = _resp_json(resp)
             code = data.get("code")
             if code == "1001":
@@ -203,307 +316,46 @@ class APIClient:
                 return False, f"code={code} msg={msg}"
             rows = data.get("datas", {}).get("getFloorData", {}).get("rows", [])
             return True, [FloorInfo(r) for r in rows]
-        except Exception as exc:
+        except SessionExpiredError:
+            self._mark_expired()
+            return "expired", []
+        except (requests.RequestException, InvalidResponseError, TypeError) as exc:
             return False, f"exception: {exc}"
 
-    def get_sub_floors(self, place_wid: str, date_str: str) -> Tuple[bool, List[dict]]:
-        # Static partition data — backend filters based on session state,
-        # so we serve the complete statically known list instead.
-        STATIC_SUB_FLOORS = [
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "39bd32fd4f3d417f9c787351200b3cd0",
-                "FLOOR_NUM": "三层-西区-C区",
-                "VERT_NUM": 9,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 26,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "3hgn29vj30th3ic23lli2b4g23qf3cu5521",
-                "CZRQ": "2025-09-03 18:57:41",
-                "IS_USE": "1",
-                "PX": 2.0,
-                "IS_PER_DISPLAY": "是"
-            },
-            {
-                "IS_PER": "0",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "d19b1a281d1e447d9d118de58c4c6628",
-                "FLOOR_NUM": "二层-西区-A区",
-                "VERT_NUM": 3,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 28,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "3f5n3t7d3ga63tul3t2t2kqp2ck52867551",
-                "CZRQ": "2025-03-24 15:31:44",
-                "IS_USE": "1",
-                "PX": 4.0,
-                "IS_PER_DISPLAY": "否"
-            },
-            {
-                "IS_PER": "0",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "9eede20e61ea4c4a85ae31dd3035fc6b",
-                "FLOOR_NUM": "二层-西区-D区",
-                "VERT_NUM": 3,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 32,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "3f5n3t7d3ga63tul3t2t2kqp2ck52867551",
-                "CZRQ": "2025-03-24 15:31:53",
-                "IS_USE": "1",
-                "PX": 4.0,
-                "IS_PER_DISPLAY": "否"
-            },
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "bf36f271125547538bbc0e02bdbbc9e5",
-                "FLOOR_NUM": "二层-北区",
-                "VERT_NUM": 10,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 12,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "2m6024cq2pah3auv37uf252c31ne26ss371",
-                "CZRQ": "2025-03-24 15:32:02",
-                "IS_USE": "1",
-                "PX": 5.0,
-                "IS_PER_DISPLAY": "是"
-            },
-            {
-                "IS_PER": "0",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "43ba1a9883ac409c947f7107520b7ae2",
-                "FLOOR_NUM": "二层-东区-A区",
-                "VERT_NUM": 3,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 26,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "293l358s2tij3a1c229h2lj934gl28ou201",
-                "CZRQ": "2025-03-24 15:30:26",
-                "IS_USE": "1",
-                "PX": 1.0,
-                "IS_PER_DISPLAY": "否"
-            },
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "0558e4243c8e4eeb84ed1d8f655a0b98",
-                "FLOOR_NUM": "二层-东区-B区",
-                "VERT_NUM": 9,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 26,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "3c1u3iq42npc378f20dv2vhh3qds39gf71",
-                "CZRQ": "2025-03-24 15:30:18",
-                "IS_USE": "1",
-                "PX": 1.0,
-                "IS_PER_DISPLAY": "是"
-            },
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "227056D931865113E06301120A0A7414",
-                "FLOOR_NUM": "三层-西区-A区",
-                "VERT_NUM": 3,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 29,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "3n292p1j2b4t3vuh3ctn2eev34lb2v6e311",
-                "CZRQ": "2025-09-03 18:57:38",
-                "IS_USE": "1",
-                "PX": 2.0,
-                "IS_PER_DISPLAY": "是"
-            },
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "227056D931885113E06301120A0A7414",
-                "FLOOR_NUM": "三层-西区-D区",
-                "VERT_NUM": 3,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 32,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "3ji72e9533r12b4k3fvc37hj3ckn2i74881",
-                "CZRQ": "2025-09-03 18:57:47",
-                "IS_USE": "1",
-                "PX": 2.0,
-                "IS_PER_DISPLAY": "是"
-            },
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "227056D931895113E06301120A0A7414",
-                "FLOOR_NUM": "三层-北区",
-                "VERT_NUM": 10,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 12,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "2jri3j9b282p3fji2kif3vqb357p2ojp711",
-                "CZRQ": "2024-10-16 09:27:15",
-                "IS_USE": "1",
-                "PX": 3.0,
-                "IS_PER_DISPLAY": "是"
-            },
-            {
-                "IS_PER": "0",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "227056D9318A5113E06301120A0A7414",
-                "FLOOR_NUM": "三层-东区-A区",
-                "VERT_NUM": 3,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 29,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "2s8m3hff32i826nh2qk031cb26et35a2351",
-                "CZRQ": "2024-10-16 09:25:25",
-                "IS_USE": "1",
-                "PX": 1.0,
-                "IS_PER_DISPLAY": "否"
-            },
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "227056D9318B5113E06301120A0A7414",
-                "FLOOR_NUM": "三层-东区-B区",
-                "VERT_NUM": 9,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 26,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "23lh25i23idk2hce2f2t21ji3l8n2bhg21",
-                "CZRQ": "2024-10-16 09:25:09",
-                "IS_USE": "1",
-                "PX": 1.0,
-                "IS_PER_DISPLAY": "是"
-            },
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "227056D9318D5113E06301120A0A7414",
-                "FLOOR_NUM": "三层-东区-C区",
-                "VERT_NUM": 9,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 26,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "3dd72nt83hap35d53v8m39sg328f3kj6301",
-                "CZRQ": "2024-10-16 09:25:42",
-                "IS_USE": "1",
-                "PX": 1.0,
-                "IS_PER_DISPLAY": "是"
-            },
-            {
-                "IS_PER": "0",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "227056D9318E5113E06301120A0A7414",
-                "FLOOR_NUM": "三层-东区-D区",
-                "VERT_NUM": 3,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 32,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "22h72p8e2tj62ofh3mo629vn36s428np141",
-                "CZRQ": "2024-10-16 09:25:51",
-                "IS_USE": "1",
-                "PX": 1.0,
-                "IS_PER_DISPLAY": "否"
-            },
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "befaea6c56c9461ea03aa35ccaff625a",
-                "FLOOR_NUM": "三层-西区-B区",
-                "VERT_NUM": 6,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 26,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "2beq3nfs30c13m6l3no033ss3vd123n8941",
-                "CZRQ": "2025-09-03 19:02:40",
-                "IS_USE": "1",
-                "PX": 2.0,
-                "IS_PER_DISPLAY": "是"
-            },
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "3a3612595f1c46cab72753ef42f0a7a7",
-                "FLOOR_NUM": "二层-西区-B区",
-                "VERT_NUM": 9,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 26,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "3f5n3t7d3ga63tul3t2t2kqp2ck52867551",
-                "CZRQ": "2025-03-24 15:31:47",
-                "IS_USE": "1",
-                "PX": 4.0,
-                "IS_PER_DISPLAY": "是"
-            },
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "df4ae4ea97584ae3b12994ae539e22a6",
-                "FLOOR_NUM": "二层-东区-C区",
-                "VERT_NUM": 9,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 26,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "3g6o25ce2frs2ta330ih2sck32i83vti841",
-                "CZRQ": "2025-03-24 15:30:37",
-                "IS_USE": "1",
-                "PX": 1.0,
-                "IS_PER_DISPLAY": "是"
-            },
-            {
-                "IS_PER": "0",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "0ef331778f1a4b8d873b6bc9effc33d7",
-                "FLOOR_NUM": "二层-东区-D区",
-                "VERT_NUM": 3,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 32,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "2mj22olb34tf36rb2ab43kej3jp529an641",
-                "CZRQ": "2025-03-24 15:30:29",
-                "IS_USE": "1",
-                "PX": 1.0,
-                "IS_PER_DISPLAY": "否"
-            },
-            {
-                "IS_PER": "1",
-                "PLACE_WID": "fb9dedd807fc48a59dc19338a50ea099",
-                "WID": "1bb4a4c88dca4111bfa3310961112705",
-                "FLOOR_NUM": "二层-西区-C区",
-                "VERT_NUM": 9,
-                "IS_USE_DISPLAY": "是",
-                "CZR": "ampadmin",
-                "HORI_NUM": 26,
-                "CZZXM": "ampadmin",
-                "FLOOR_DRAWING": "28ro3gk42smm3jk927hp3gkq3q0m20rr81",
-                "CZRQ": "2025-03-24 15:31:50",
-                "IS_USE": "1",
-                "PX": 4.0,
-                "IS_PER_DISPLAY": "是"
-            },
-        ]
-        return True, STATIC_SUB_FLOORS
+    def get_sub_floors(self, place_wid: str, date_str: str) -> Tuple[ApiStatus, List[dict]]:
+        """Load live partition data, falling back to the last known built-in map."""
+        url = f"{BASE_URL}/modules/myAppointment/getLimitFloorData.do"
+        payload = {
+            "PLACE_WID": place_wid,
+            "PLACE_WID1": place_wid,
+            "BEGINNING_DATE": f"{date_str} 08:00",
+            "BEGINNING_DATE1": f"{date_str} 08:00",
+            "ENDING_DATE": f"{date_str} 09:59",
+            "ENDING_DATE1": f"{date_str} 09:59",
+        }
+        try:
+            resp = self._request("POST", url, data=payload, timeout=15)
+            resp.raise_for_status()
+            data = _resp_json(resp)
+            code = data.get("code")
+            if code == "1001":
+                return "expired", []
+            rows = data.get("datas", {}).get("getLimitFloorData", {}).get("rows", [])
+            if (code == "0" or code == 0) and rows:
+                return True, rows
+            log.warning("live sub-floor response was unusable; using fallback (code=%s)", code)
+        except SessionExpiredError:
+            self._mark_expired()
+            return "expired", []
+        except (requests.RequestException, InvalidResponseError, TypeError) as exc:
+            log.warning("live sub-floor request failed; using fallback: %s", exc)
+
+        # Last-known map for temporary upstream failures.
+        return True, get_fallback_sub_floors(place_wid)
 
     def get_seats(self, place_wid: str, floor_num: str,
-                  date_str: str, begin_time: str, end_time: str,
-                  ) -> Tuple[bool, List[SeatInfo]]:
+                   date_str: str, begin_time: str, end_time: str,
+                   ) -> Tuple[ApiStatus, Union[List[SeatInfo], str]]:
         url = f"{BASE_URL}/api/getApplySeatDetailNew.do"
         payload = {
             "formData": json.dumps({
@@ -514,7 +366,8 @@ class APIClient:
             }),
         }
         try:
-            resp = self.session.post(url, data=payload, timeout=15)
+            resp = self._request("POST", url, data=payload, timeout=15)
+            resp.raise_for_status()
             data = _resp_json(resp)
             code = data.get("code")
             if code == "1001":
@@ -523,13 +376,18 @@ class APIClient:
                 return False, []
             rows = data.get("data", [])
             return True, [SeatInfo(r) for r in rows]
-        except Exception:
-            return False, []
+        except SessionExpiredError:
+            self._mark_expired()
+            return "expired", []
+        except (requests.RequestException, InvalidResponseError, TypeError) as exc:
+            log.warning("seat request failed: %s", exc)
+            return False, str(exc)
 
-    def get_violations(self) -> Tuple[bool, Optional[ViolationInfo]]:
+    def get_violations(self) -> Tuple[ApiStatus, Optional[ViolationInfo]]:
         url = f"{BASE_URL}/api/getViolated.do"
         try:
-            resp = self.session.get(url, timeout=15)
+            resp = self._request("GET", url, timeout=15)
+            resp.raise_for_status()
             data = _resp_json(resp)
             code = data.get("code")
             if code == "1001":
@@ -537,12 +395,16 @@ class APIClient:
             if code != "0" and code != 0:
                 return False, None
             return True, ViolationInfo(data)
-        except Exception:
+        except SessionExpiredError:
+            self._mark_expired()
+            return "expired", None
+        except (requests.RequestException, InvalidResponseError, TypeError) as exc:
+            log.warning("violation request failed: %s", exc)
             return False, None
 
     def get_appointment_records(self, date_str: str, page: int = 1,
                                 page_size: int = 10,
-                                cancelled_filter: str = "") -> Tuple[bool, dict]:
+                                cancelled_filter: str = "") -> Tuple[ApiStatus, dict]:
         """Get appointment records for a given date.
         cancelled_filter: "" = all, "0" = not cancelled, "1" = cancelled
         Returns (ok, {"total": int, "rows": [AppointmentRecord, ...]})
@@ -571,7 +433,8 @@ class APIClient:
             "pageNumber": str(page),
         }
         try:
-            resp = self.session.post(url, data=payload, timeout=15)
+            resp = self._request("POST", url, data=payload, timeout=15)
+            resp.raise_for_status()
             data = _resp_json(resp)
             code = data.get("code")
             if code == "1001":
@@ -582,10 +445,13 @@ class APIClient:
             total = record_data.get("totalSize", 0)
             rows = [AppointmentRecord(r) for r in record_data.get("rows", [])]
             return True, {"total": total, "rows": rows}
-        except Exception as exc:
+        except SessionExpiredError:
+            self._mark_expired()
+            return "expired", {}
+        except (requests.RequestException, InvalidResponseError, TypeError) as exc:
             return False, {"error": str(exc)}
 
-    def cancel_appointment(self, wid: str, ending_date: str) -> Tuple[bool, str]:
+    def cancel_appointment(self, wid: str, ending_date: str) -> Tuple[ApiStatus, str]:
         """Cancel an appointment. Returns (ok, message)."""
         url = f"{BASE_URL}/api/appointmentCancel.do"
         payload = {
@@ -595,7 +461,8 @@ class APIClient:
             }),
         }
         try:
-            resp = self.session.post(url, data=payload, timeout=15)
+            resp = self._request("POST", url, data=payload, timeout=15)
+            resp.raise_for_status()
             data = _resp_json(resp)
             code = data.get("code")
             if code == "1001":
@@ -608,10 +475,13 @@ class APIClient:
             if msg:
                 return False, f"{msg}"
             return False, f"code={code} resp={json.dumps(data, ensure_ascii=False)[:300]}"
-        except Exception as exc:
+        except SessionExpiredError:
+            self._mark_expired()
+            return "expired", "Cookie 已过期"
+        except (requests.RequestException, InvalidResponseError, TypeError) as exc:
             return False, str(exc)
 
-    def cancel_appointments(self, records: List[dict]) -> Tuple[bool, str]:
+    def cancel_appointments(self, records: List[dict]) -> Tuple[ApiStatus, str]:
         """Batch cancel appointments.
 
         ``records`` is a list of dicts each containing ``wid`` and
@@ -637,22 +507,41 @@ class APIClient:
         summary = f"成功取消 {ok_count} 条，失败 {len(errors)} 条"
         if errors:
             summary += " | " + "；".join(errors[:3])
-        return True, summary
+        return False, summary
 
     def read_notice(self) -> bool:
         url = f"{BASE_URL}/modules/myAppointment/T_PUBLIC_PLACE_READ_SAVE.do"
         try:
-            self.session.post(url, data={}, timeout=15)
+            resp = self._request("POST", url, data={}, timeout=15)
+            resp.raise_for_status()
             return True
-        except Exception:
+        except requests.RequestException as exc:
+            log.warning("notice acknowledgement failed: %s", exc)
             return False
 
     def submit_booking(self, seat: SeatInfo,
                        place_wid: str, floor_wid: str, place_name: str,
                        date_str: str, begin_time: str, end_time: str,
-                       ) -> Tuple[bool, str]:
+                       ) -> Tuple[ApiStatus, str]:
+        if not self._cookie_loaded:
+            return False, "当前未登录，请先登录"
+        if not self.get_user_id() or not self.get_user_name():
+            return False, "用户信息不完整，请重新登录后再预约"
+        if not seat or not seat.WID or not seat.SEAT_NUM:
+            return False, "座位信息无效，请重新加载并选择座位"
+        if not place_wid or not floor_wid or not date_str or not begin_time or not end_time:
+            return False, "预约参数不完整，请重新选择日期、分区和时段"
+        if not seat.is_available:
+            return False, "所选座位当前不可用"
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            begin = datetime.strptime(begin_time[:5], "%H:%M")
+            end = datetime.strptime(end_time[:5], "%H:%M")
+        except (TypeError, ValueError):
+            return False, "日期或时段格式无效"
+        if end <= begin:
+            return False, "结束时间必须晚于开始时间"
         url = f"{BASE_URL}/api/appointmentSave.do"
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
         short_begin = dt.strftime("%m-%d") + " " + begin_time[:5]
         short_end = dt.strftime("%m-%d") + " " + end_time[:5]
         payload = {
@@ -681,12 +570,15 @@ class APIClient:
             }),
         }
         try:
-            resp = self.session.post(url, data=payload, timeout=15)
+            resp = self._request("POST", url, data=payload, timeout=15)
             if resp.status_code != 200:
                 return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
             try:
                 data = _resp_json(resp)
-            except ValueError:
+            except SessionExpiredError:
+                self._mark_expired()
+                return "expired", "Cookie 已过期"
+            except (InvalidResponseError, ValueError):
                 return False, f"Invalid JSON response: {resp.text[:200]}"
             ok = data.get("code") == 0 or data.get("code") == "0"
             msg = data.get("msg", "")
@@ -697,4 +589,5 @@ class APIClient:
             return False, str(ex)
 
     def close(self) -> None:
-        self.session.close()
+        with self._session_lock:
+            self.session.close()

@@ -25,11 +25,6 @@ DB_USER = _env("DB_USER", "root")
 DB_PASSWORD = _env("DB_PASSWORD", "")
 DB_NAME = _env("DB_NAME", "library_seat")
 
-SQLALCHEMY_DATABASE_URI = (
-    f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-    "?charset=utf8mb4"
-)
-
 # -- JWT（后台管理登录态）--
 JWT_SECRET = _env("JWT_SECRET", "")
 JWT_EXPIRE_HOURS = int(_env("JWT_EXPIRE_HOURS", "24") or 24)
@@ -40,6 +35,8 @@ LICENSE_KEY = _env("LICENSE_KEY", "")
 # -- 管理员播种（admins 表为空时用）--
 ADMIN_USERNAME = _env("ADMIN_USERNAME", "")
 ADMIN_PASSWORD = _env("ADMIN_PASSWORD", "")
+MIN_CLIENT_VERSION = _env("MIN_CLIENT_VERSION", "6.0")
 
 # -- 旧版 /logs 简单页面查看密钥（可选）--
 LOG_VIEW_KEY = _env("LOG_VIEW_KEY", "")
+
