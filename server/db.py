@@ -192,6 +192,11 @@ def _serialize_row(row) -> dict:
             result[key] = value.isoformat(timespec="minutes")
         elif isinstance(value, datetime.date):
             result[key] = value.isoformat()
+        elif isinstance(value, datetime.timedelta):
+            total_seconds = int(value.total_seconds())
+            hours, rem = divmod(total_seconds, 3600)
+            minutes, seconds = divmod(rem, 60)
+            result[key] = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     return result
 
 
