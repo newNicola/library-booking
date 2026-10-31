@@ -14,6 +14,8 @@
 5. [查询违约记录](#5-查询违约记录)
 6. [阅读公告](#6-阅读公告)
 7. [提交预约](#7-提交预约)
+8. [查看预约记录](#8-查看预约记录)
+9. [取消预约](#9-取消预约)
 
 ---
 
@@ -29,16 +31,17 @@
 
 ### 1.2 Cookie 保存
 
-登录成功后，应用从 Playwright 上下文提取所有域名包含 `ehall` 的 Cookie，保存为扁平 JSON 到 `cookies.json`：
+登录成功后，应用从 Playwright 上下文提取 storage_state，保存到应用数据目录（Windows 默认为 `%LOCALAPPDATA%\数图预约`）的 `cookies.json`，Windows 下经 DPAPI 保护：
 
 ```json
 {
-  "SESSION": "xxx",
-  "...": "..."
+  "cookies": [
+    {"name": "SESSION", "value": "xxx", "domain": ".ehall.hebau.edu.cn"}
+  ]
 }
 ```
 
-后续所有 API 请求均通过 `requests.Session` 自动携带这些 Cookie。
+旧版扁平 JSON（`{"SESSION": "xxx"}`）仍可读取，读取后会自动迁移为上述格式。后续所有 API 请求均通过 `requests.Session` 自动携带这些 Cookie（CAS 域名 `cas.hebau.edu.cn` 的 Cookie 会被主动跳过）。
 
 ### 1.3 用户信息提取
 
@@ -338,6 +341,116 @@
 
 - 如果 HTTP 状态码不是 200，直接返回网络错误
 - 如果响应不是合法 JSON，返回解析错误
+
+---
+
+## 8. 查看预约记录
+
+获取指定日期的预约记录，GUI 的记录查看入口即用此接口。
+
+| 项目 | 值 |
+|------|-----|
+| **URL** | `{BASE_URL}/modules/myAppointment/getMyAppointmentRecord.do` |
+| **方法** | POST |
+| **Content-Type** | `application/x-www-form-urlencoded` |
+
+### 请求参数
+
+| 参数 | 示例值 | 说明 |
+|------|--------|------|
+| `querySetting` | JSON 字符串 | 过滤条件数组，见下 |
+| `pageSize` | `"10"` | 每页条数 |
+| `pageNumber` | `"1"` | 页码 |
+
+`querySetting` 为过滤条件数组的 JSON 字符串，至少包含预约日期条件，可选附加是否取消条件：
+
+```json
+[
+  {"name": "APPLY_DATE", "caption": "预约日期", "linkOpt": "AND", "builderList": "cbl_String", "builder": "equal", "value": "2026-10-31"},
+  {"name": "IS_CANCELLED", "caption": "是否取消", "linkOpt": "AND", "builderList": "cbl_String", "builder": "equal", "value": "0"}
+]
+```
+
+其中 `IS_CANCELLED` 省略表示全部，`"0"` 表示未取消，`"1"` 表示已取消。
+
+### 响应格式
+
+```json
+{
+  "code": "0",
+  "datas": {
+    "getMyAppointmentRecord": {
+      "totalSize": 3,
+      "rows": [
+        {
+          "WID": "xxx",
+          "FLOOR_ID_DISPLAY": "二层、三层",
+          "SEAT_WID_DISPLAY": "2001",
+          "BEGINNING_DATE": "2026-10-31 08:00",
+          "ENDING_DATE": "2026-10-31 09:59",
+          "IS_CANCELLED_DISPLAY": "否",
+          "IS_VIOLATED_DISPLAY": "否",
+          "CREATED_AT": "2026-10-30 20:00:00"
+        }
+      ]
+    }
+  }
+}
+```
+
+### 响应码说明
+
+| code | 含义 |
+|------|-----|
+| `"0"` 或 `0` | 成功 |
+| `"1001"` | Cookie 已过期，需重新登录 |
+| 其他 | 失败 |
+
+---
+
+## 9. 取消预约
+
+取消单条预约；GUI 的批量取消即按顺序逐条调用本接口并汇总结果。
+
+| 项目 | 值 |
+|------|-----|
+| **URL** | `{BASE_URL}/api/appointmentCancel.do` |
+| **方法** | POST |
+| **Content-Type** | `application/x-www-form-urlencoded` |
+
+### 请求参数
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `formData` | JSON 字符串 | 见下 |
+
+#### formData 内部字段
+
+| 字段 | 格式 | 说明 |
+|------|------|------|
+| `WID` | 预约记录 WID | 要取消的预约唯一标识（来自第 8 节的记录） |
+| `ENDING_DATE` | `YYYY-MM-DD HH:MM:SS` | 该预约的结束时间 |
+
+### 响应格式
+
+```json
+{
+  "code": 0,
+  "msg": "取消成功"
+}
+```
+
+### 响应码说明
+
+| code | 含义 |
+|------|-----|
+| `0` 或 `"0"` | 取消成功 |
+| `"1001"` | Cookie 已过期，需重新登录 |
+| 其他 | 取消失败，`msg` 包含失败原因 |
+
+### 批量取消说明
+
+批量取消没有单独的服务端接口：客户端按顺序逐条调用单条取消，任一条返回 `1001` 即整体按 Cookie 过期处理；结束时汇总成功条数与失败原因（失败原因最多展示前 3 条）。
 
 ---
 

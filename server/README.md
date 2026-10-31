@@ -2,9 +2,11 @@
 
 Flask + MySQL + Vue3 后端，单端口同源部署，接口：
 
-- `POST /check_key` — 客户端授权密钥验证（兼容老接口，新增 `user_id` 封禁检查）
+- `POST /check_key` — 客户端授权密钥验证（含最低客户端版本校验，低于 `MIN_CLIENT_VERSION` 的客户端会被拒绝）
+- `POST /check_ban` — 客户端提交预约前查询指定学号是否被封禁
 - `POST /log_booking` — 客户端上报预约日志
 - `GET /health` — 就绪检查（包含数据库连接检测）
+- `GET /logs` — 简易 HTML 日志查看（兜底页，可选 `LOG_VIEW_KEY` 保护；后台 SPA 已取代，见安全提示）
 - `/api/*` — 后台管理接口（JWT 鉴权）
 - `/` — 托管 Vue3 后台管理页面（SPA）
 
